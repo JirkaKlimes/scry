@@ -1,0 +1,50 @@
+[package]
+name = "scry-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "grep for images: search by metadata, OCR text, and meaning"
+repository = "https://github.com/JirkaKlimes/scry"
+license = "MIT OR Apache-2.0"
+keywords = ["image", "search", "cli", "ocr", "semantic"]
+categories = ["command-line-utilities", "multimedia::images"]
+include = ["/src", "/LICENSE-*", "/README.md"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+dirs = "7.0.0"
+half = "2.7.1"
+ignore = "0.4.34"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+indicatif = "0.18.6"
+jiff = "0.2.39"
+kamadak-exif = "0.6.2"
+ocrs = "0.13.1"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "=12.0.0-rc.3", default-features = false, features = ["crossterm"] }
+rayon = "1.12.0"
+redb = "4.5.0"
+regex = "1.13.1"
+regex-syntax = "0.8.11"
+rten = "0.26"
+rustix = { version = "1.1.6", features = ["event", "fs", "stdio", "termios"] }
+sha2 = "0.11.1"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+ureq = "3.5.1"
+
+[[bin]]
+name = "scry"
+path = "src/main.rs"
+
+# Inference in debug builds is unusably slow without optimized dependencies.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dist]
+inherits = "release"
