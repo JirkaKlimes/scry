@@ -3,14 +3,25 @@
 //! cell to its left, but only if that cell shows the same image. ratatui-image writes the
 //! diacritics in the first column only. So a tile or a label that covers the left part of a row
 //! breaks the rest of that row, and kitty draws nothing there.
+//!
+//! The first cell of a new image also carries the escape sequence that sends the image, on the
+//! first draw only. A label over that cell would lose the image for good, so `keep` puts the
+//! escape sequence back.
 
-use ratatui::{buffer::Buffer, layout::Rect};
+use std::num::NonZeroU16;
+
+use ratatui::{
+    buffer::{Buffer, CellDiffOption, CellWidth},
+    layout::{Position, Rect},
+};
 
 const PLACEHOLDER: char = '\u{10EEEE}';
 
 /// Writes the row and column into every placeholder cell of the image in `area`. Call right after
 /// the image is drawn in `area`. Other protocols do not use placeholders and stay as they are.
 pub fn anchor(buf: &mut Buffer, area: Rect) {
+    // The terminal can shrink after the layout and before the frame.
+    let area = area.intersection(buf.area);
     for y in area.top()..area.bottom() {
         // The placeholder, then the row, column 0 and the high byte of the image ID. The first
         // cell of the image also starts with the escape sequence that sends the image.
@@ -23,6 +34,45 @@ pub fn anchor(buf: &mut Buffer, area: Rect) {
         for (x, &column) in (area.x + 1..area.right()).zip(&DIACRITICS[1..]) {
             buf[(x, y)].set_symbol(&String::from_iter([PLACEHOLDER, row, column, id]));
         }
+    }
+}
+
+/// The escape sequence that sends a new image, and the cell that carries it.
+pub struct Transmit {
+    at: Position,
+    escape: String,
+}
+
+/// The transmit of the image in `area`, if this is the first draw of that image. Call right after
+/// the image is drawn, before anything covers it.
+pub fn transmit(buf: &Buffer, area: Rect) -> Option<Transmit> {
+    let at = area.as_position();
+    let symbol = buf.cell(at)?.symbol();
+    let escape = &symbol[..symbol.find(PLACEHOLDER)?];
+    (!escape.is_empty()).then(|| Transmit {
+        at,
+        escape: escape.to_owned(),
+    })
+}
+
+/// Puts each escape sequence back in front of what now covers its cell. kitty reads the image
+/// first and then prints the cell. Call after everything else in the frame is drawn.
+pub fn keep(buf: &mut Buffer, transmits: Vec<Transmit>) {
+    for Transmit { at, escape } in transmits {
+        let Some(cell) = buf.cell_mut(at) else {
+            continue;
+        };
+        // Not `starts_with`: when a new image covers another one, both escapes are in front.
+        if cell.symbol().contains(&escape) {
+            continue;
+        }
+        // The escape sequence takes no room on screen, so the cell keeps the width of what
+        // covers it. Without a forced width, ratatui counts the escape as text and skips the
+        // cells after it.
+        let width = NonZeroU16::new(cell.cell_width()).unwrap_or(NonZeroU16::MIN);
+        let symbol = escape + cell.symbol();
+        cell.set_symbol(&symbol)
+            .set_diff_option(CellDiffOption::ForcedWidth(width));
     }
 }
 
@@ -71,6 +121,8 @@ const DIACRITICS: [char; 297] = [
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Style;
+
     use super::*;
 
     fn placeholder(row: usize, column: usize) -> String {
@@ -95,5 +147,61 @@ mod tests {
         assert_eq!(buf[(0, 0)].symbol(), first);
         assert_eq!(buf[(3, 0)].symbol(), placeholder(1, 3));
         assert_eq!(buf[(2, 1)].symbol(), " ");
+    }
+
+    const SEND: &str = "\x1b_Gsend\x1b\\";
+
+    /// The first row of a new image in `buf`, as ratatui-image draws it.
+    fn first_draw(buf: &mut Buffer) {
+        buf[(0, 0)]
+            .set_symbol(&format!("{SEND}{}", placeholder(0, 0)))
+            .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+        for x in 1..4 {
+            buf[(x, 0)]
+                .set_symbol(&placeholder(0, x.into()))
+                .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+        }
+    }
+
+    #[test]
+    fn a_label_over_the_first_cell_keeps_the_transmit() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        first_draw(&mut buf);
+        let sent = transmit(&buf, area).into_iter().collect();
+        buf.set_string(0, 0, "ab", Style::new());
+        keep(&mut buf, sent);
+        assert_eq!(buf[(0, 0)].symbol(), format!("{SEND}a"));
+        assert_eq!(buf[(1, 0)].symbol(), "b");
+        let cells: Vec<(u16, String)> = (Buffer::empty(area).diff(&buf).into_iter())
+            .map(|(x, _, cell)| (x, cell.symbol().to_owned()))
+            .collect();
+        assert_eq!(cells[..2], [(0, format!("{SEND}a")), (1, "b".into())]);
+    }
+
+    #[test]
+    fn the_width_holds_on_a_cell_without_options() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        first_draw(&mut buf);
+        let sent = transmit(&buf, area).into_iter().collect();
+        buf[(0, 0)].reset();
+        buf[(0, 0)].set_symbol("✓");
+        keep(&mut buf, sent);
+        assert_eq!(buf[(0, 0)].cell_width(), 1);
+    }
+
+    #[test]
+    fn later_draws_and_uncovered_cells_stay() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buf = Buffer::empty(area);
+        first_draw(&mut buf);
+        let first = buf[(0, 0)].symbol().to_owned();
+        let sent = transmit(&buf, area).into_iter().collect();
+        keep(&mut buf, sent);
+        assert_eq!(buf[(0, 0)].symbol(), first);
+
+        buf[(0, 0)].set_symbol(&placeholder(0, 0));
+        assert!(transmit(&buf, area).is_none());
     }
 }

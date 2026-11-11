@@ -15,7 +15,7 @@ scry --date 2024-06..2024-08 --gps ~/Pictures
 scry -s -q "foggy forest" ~/Pictures
 ```
 
-The first command ranks images by what they show, best first. The second finds text in images. The third keeps the photos from summer 2024 that have a GPS location. The fourth shows the matches in [scatter mode](#scatter-mode), where you pick one by eye.
+The first command ranks images by what they show, best first. The second finds text in images. The third keeps the photos from summer 2024 that have a GPS location. The fourth shows the matches in scatter mode, where you [pick one by eye](#pick-by-eye).
 
 scry prints paths, so it works in pipelines. It runs on your CPU, and after a one-time model download it works offline.
 
@@ -105,9 +105,10 @@ Each `PATH` is a file or a directory. With no `PATH`, scry reads image paths fro
 | `--hidden` | Search hidden files and directories. |
 | `--no-ignore` | Do not read `.gitignore` and `.ignore` files. |
 | **Output** | |
-| `-s, --scatter` | Pick images by eye. See [scatter mode](#scatter-mode). |
+| `-s, --scatter` | Pick images by eye, one at a time. See [scatter mode](#scatter-mode). |
+| `--grid` | Pick images by eye from pages of thumbnails. Not with `-s`. See [grid mode](#grid-mode). |
 | `--order <ORDER>` | Sort by `--date`: `newest` or `oldest` first. Not with `-q` or `-l`. |
-| `-n, --limit <N>` | Print at most N paths, or `all`. Default: 20 with `-q` or `-l` and no `--min` or `-s`, else all. |
+| `-n, --limit <N>` | Print at most N paths, or `all`. Default: 20 with `-q` or `-l` and no `--min`, `-s` or `--grid`, else all. |
 | `-S, --score` | Print the score and a tab before each path. Needs `-q` or `-l`. |
 | `-p, --preview` | Show a thumbnail above each path when stdout is a terminal. |
 | `-0, --null` | Separate paths with NUL, on stdin and on stdout. |
@@ -121,9 +122,15 @@ A RANGE is `A..B`, `A..`, `..B` or `A`. Both ends are inclusive.
 
 scry uses one order for each search. With `-q` or `-l`, the best match comes first. With `--order`, the newest or oldest image comes first. Else, scry prints each match when it finds it, and paths from stdin keep their order. A sorted search must see all images before it prints the first path. Then `-n` cuts the slow steps short: scry reads the text in the images in that order and stops when it has enough matches.
 
-Exit status: `0` scry printed a path, `1` nothing matched, `2` an error (also when nothing matched and some files could not be read), `130` you quit scatter mode.
+Exit status: `0` scry printed a path, `1` nothing matched, `2` an error (also when nothing matched and some files could not be read), `130` you quit scatter or grid mode.
 
-## Scatter mode
+## Pick by eye
+
+A description can match many images. scry has two modes to pick the right one by eye. Scatter mode (`-s`) shows the matches one at a time, so your eye checks only the newest image. Grid mode (`--grid`) shows them in pages of up to 26, so you can compare them side by side.
+
+Like fzf, both modes draw on the terminal and write only the result to stdout. So `scry -s ... | xargs ...` and `$(scry --grid ...)` work.
+
+### Scatter mode
 
 `scry -s` shows the images one at a time, each at a different place on the screen. A new image lands on top and covers the part of the screen that has been visible longest. No image disappears while you can see a part of it, so your eye goes only to the newest one.
 
@@ -143,9 +150,29 @@ With `-q` or `-l`, scry scores all images before it shows the first one. Then th
 
 When you go back, the newest image on screen is selected and gets the hint letter `a`. So if you see a good image too late, press `←` until it is selected, then press `Enter`, or `A` to see it full screen. `Space` plays on from there.
 
-Like fzf, scatter mode draws on the terminal and writes only the result to stdout. So `scry -s ... | xargs ...` and `$(scry -s ...)` work.
+### Grid mode
 
-kitty, Ghostty, WezTerm, foot and other terminals with sixel support show full-resolution images. Other terminals get Unicode half blocks, at low resolution. kitty and Ghostty read the images from shared memory when scry runs on the same computer, which keeps scatter mode fast, also in tmux. In tmux, scry turns on `allow-passthrough` for its own pane.
+`scry --grid` shows the images in pages of thumbnails. A page holds up to 26 images, one for each hint letter. The terminal size sets the number of columns and rows. All tiles have the same size and touch each other. scry crops each image to fill its tile, and `A` to `Z` show the whole image.
+
+The images keep the order of the search, from left to right and top to bottom. So with `-q` or `-l`, the best match is `a` on the first page. A sorted search must see all images before it shows the first page.
+
+| Key | Action |
+|---|---|
+| `a` to `z` | Select the image with that hint letter. |
+| `A` to `Z` | Select that image and show it full screen. There, `←` and `→` go through the images, also to other pages, `Enter` prints it with the marked images, `Tab` marks it, and any other key goes back. |
+| `Tab` | Mark or unmark the selected image. |
+| `Enter` | Print the marked images in mark order, or else the selected image, and quit. |
+| `→`, `Space`, `PageDown` | Show the next page. |
+| `←`, `PageUp` | Show the previous page. |
+| `Esc`, `Ctrl-C` | Quit and print nothing. |
+
+When the grid opens, and after each page change, the first image of the page is selected. The status line shows the name of the selected file and the page, for example `page 2/5`.
+
+### Terminals
+
+kitty, Ghostty, WezTerm, foot and other terminals with sixel support show full-resolution images. Other terminals get Unicode half blocks, at low resolution. kitty and Ghostty read the images from shared memory when scry runs on the same computer, which keeps both modes fast, also in tmux. In tmux, scry turns on `allow-passthrough` for its own pane.
+
+In both modes, the selected image has a yellow edge and a white hint letter. A marked image has a green edge and a check mark. In kitty and Ghostty, the edge colors follow the terminal palette. With half blocks, the edge is a ring of half blocks. With sixel and iTerm2 images, the edge stays gray, so the white hint letter and the status line show the selection.
 
 ## How it works
 

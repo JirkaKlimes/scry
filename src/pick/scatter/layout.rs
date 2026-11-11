@@ -263,19 +263,6 @@ fn cover<T>(tiles: &[Tile<T>], bounds: Rect) -> Vec<Option<usize>> {
     top
 }
 
-/// Size in cells for an image of `image` pixels in cells of `font` pixels: the image's own
-/// aspect, about `area` cells, and no larger than `room`.
-pub fn image_cells(image: (u32, u32), font: Size, area: f32, room: Size) -> Size {
-    let aspect = image.0 as f32 / image.1 as f32 * f32::from(font.height) / f32::from(font.width);
-    let height = (area / aspect).sqrt();
-    let width = height * aspect;
-    let fit = (f32::from(room.width) / width)
-        .min(f32::from(room.height) / height)
-        .min(1.0);
-    let cells = |n: f32, max: u16| (n * fit).round().clamp(1.0, f32::from(max.max(1))) as u16;
-    Size::new(cells(width, room.width), cells(height, room.height))
-}
-
 struct Rng(u64);
 
 impl Rng {
@@ -426,28 +413,5 @@ mod tests {
         assert_eq!(layout.own_cells(0, Position::new(0, 0), 3).width, 2);
         assert_eq!(layout.own_cells(1, Position::new(2, 0), 3).width, 3);
         assert_eq!(layout.own_cells(0, Position::new(199, 49), 3).width, 0);
-    }
-
-    #[test]
-    fn image_cells_keep_aspect_and_area() {
-        let font = Size::new(10, 20);
-        let landscape = image_cells((1600, 1200), font, 1200.0, Size::new(200, 50));
-        assert_eq!(landscape, Size::new(57, 21));
-        let portrait = image_cells((1200, 1600), font, 1200.0, Size::new(200, 50));
-        assert_eq!(portrait, Size::new(42, 28));
-    }
-
-    #[test]
-    fn image_cells_fit_the_room() {
-        let font = Size::new(10, 20);
-        let room = Size::new(100, 30);
-        assert_eq!(
-            image_cells((1600, 1200), font, 1e6, room),
-            Size::new(80, 30)
-        );
-        assert_eq!(
-            image_cells((1600, 1200), font, 1e6, Size::new(1, 1)),
-            Size::new(1, 1)
-        );
     }
 }

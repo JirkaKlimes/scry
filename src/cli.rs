@@ -18,13 +18,14 @@ use crate::{
     embed::Prompt,
     meta::{self, MetaFilter, Range},
     output::{self, End, ListOpts, clean_path},
+    pick::View,
     search::{DateOrder, Order, Query, Rank, Scoring},
     walk::{self, Source, WalkOpts},
 };
 
 pub enum Mode {
     List(ListOpts),
-    Scatter(End),
+    Pick(View, End),
 }
 
 const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
@@ -47,7 +48,7 @@ Examples:
   scry --order newest -n 1 -t error ~/Pictures/Screenshots
 
 scry keeps models and a cache in ~/.cache/scry. Set SCRY_CACHE to use another directory.
-Exit status: 0 if scry printed a path, 1 if not, 2 on error, 130 if you quit scatter mode."
+Exit status: 0 if scry printed a path, 1 if not, 2 on error, 130 if you quit scatter or grid mode."
 )]
 struct Args {
     /// Files or directories [default: paths on stdin if it is a pipe or a file, else .]
@@ -95,7 +96,7 @@ struct Args {
     #[arg(
         short = 'o',
         long,
-        conflicts_with = "scatter",
+        conflicts_with_all = ["scatter", "grid"],
         help_heading = "Text in images"
     )]
     show_text: bool,
@@ -140,11 +141,15 @@ struct Args {
     #[arg(short, long, help_heading = "Output")]
     scatter: bool,
 
+    /// Pick images by eye from pages of thumbnails. See grid mode.
+    #[arg(long, conflicts_with = "scatter", help_heading = "Output")]
+    grid: bool,
+
     /// Sort by date, newest or oldest first
     #[arg(long, value_name = "ORDER", help_heading = "Output")]
     order: Option<DateOrder>,
 
-    /// Print at most N paths, or all [default: 20 with -q or -l, unless --min or -s]
+    /// Print at most N paths, or all [default: 20 with -q or -l, unless --min, -s or --grid]
     #[arg(short = 'n', long, value_name = "N", value_parser = limit, help_heading = "Output")]
     limit: Option<Limit>,
 
@@ -153,13 +158,18 @@ struct Args {
         short = 'S',
         long,
         requires = "rank",
-        conflicts_with = "scatter",
+        conflicts_with_all = ["scatter", "grid"],
         help_heading = "Output"
     )]
     score: bool,
 
     /// Show a thumbnail above each path in the terminal
-    #[arg(short, long, conflicts_with = "scatter", help_heading = "Output")]
+    #[arg(
+        short,
+        long,
+        conflicts_with_all = ["scatter", "grid"],
+        help_heading = "Output"
+    )]
     preview: bool,
 
     /// Separate paths with NUL instead of newline, on stdin and stdout
@@ -185,6 +195,11 @@ impl Args {
         }
         let text = regexes(&self.text, self.ignore_case)?;
         let globs = globs(&self.glob)?;
+        let view = match (self.scatter, self.grid) {
+            (true, _) => Some(View::Scatter),
+            (_, true) => Some(View::Grid),
+            _ => None,
+        };
         let rank = rank(self.query, self.not, self.like);
         let order = order(rank, self.order, self.min, self.scatter)?;
         let end = if self.null { End::Nul } else { End::Newline };
@@ -204,17 +219,16 @@ impl Args {
             },
             text,
             show_text: self.show_text,
-            limit: limit_or_default(self.limit, &order, self.scatter),
+            limit: limit_or_default(self.limit, &order, view.is_some()),
             order,
         };
-        let mode = if self.scatter {
-            Mode::Scatter(end)
-        } else {
-            Mode::List(ListOpts {
+        let mode = match view {
+            Some(view) => Mode::Pick(view, end),
+            None => Mode::List(ListOpts {
                 score: self.score,
                 preview: self.preview,
                 end,
-            })
+            }),
         };
         Ok((query, mode))
     }
@@ -293,13 +307,13 @@ fn source(paths: Vec<PathBuf>, end: End) -> Source {
     }
 }
 
-/// A ranked search prints the best few, unless it has a cutoff or shows a scatter.
-fn limit_or_default(limit: Option<Limit>, order: &Order, scatter: bool) -> Option<NonZeroUsize> {
+/// A ranked search prints the best few, unless it has a cutoff or you pick by eye.
+fn limit_or_default(limit: Option<Limit>, order: &Order, pick: bool) -> Option<NonZeroUsize> {
     match limit {
         Some(Limit::All) => None,
         Some(Limit::First(n)) => Some(n),
         None => {
-            matches!(order, Order::Score(s) if s.min.is_none() && !scatter).then_some(DEFAULT_LIMIT)
+            matches!(order, Order::Score(s) if s.min.is_none() && !pick).then_some(DEFAULT_LIMIT)
         }
     }
 }
@@ -488,6 +502,13 @@ mod tests {
         assert_eq!(err(&["-s", "-p"]), ErrorKind::ArgumentConflict);
         assert_eq!(err(&["-s", "-o"]), ErrorKind::ArgumentConflict);
         assert_eq!(err(&["-s", "-S", "-q", "cat"]), ErrorKind::ArgumentConflict);
+        assert_eq!(err(&["--grid", "-s"]), ErrorKind::ArgumentConflict);
+        assert_eq!(err(&["--grid", "-p"]), ErrorKind::ArgumentConflict);
+        assert_eq!(err(&["--grid", "-o"]), ErrorKind::ArgumentConflict);
+        assert_eq!(
+            err(&["--grid", "-S", "-q", "cat"]),
+            ErrorKind::ArgumentConflict
+        );
         assert_eq!(err(&["--width", "big"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--date", "7d"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["-t", "a[b"]), ErrorKind::ValueValidation);
@@ -568,6 +589,7 @@ mod tests {
         assert_eq!(limit(&["-q", "cat", "-n", "all"]), None);
         assert_eq!(limit(&["-q", "cat", "--min", "0.2"]), None);
         assert_eq!(limit(&["-q", "cat", "-s"]), None);
+        assert_eq!(limit(&["-q", "cat", "--grid"]), None);
         assert_eq!(limit(&["-t", "x"]), None);
         assert_eq!(limit(&["--order", "newest"]), None);
         assert_eq!(limit(&["-n", "3"]), Some(3));
@@ -613,12 +635,21 @@ mod tests {
         assert!(!q.text[0].is_match("TOTAL"));
         assert_eq!(q.meta.gps, None);
         assert!(matches!(q.order, Order::Found) && !q.meta.needs_meta());
-        assert!(matches!(mode, Mode::Scatter(End::Nul)));
+        assert!(matches!(mode, Mode::Pick(View::Scatter, End::Nul)));
         let (q, _) = parse(&["-q", "cat", "-s"]).unwrap();
         assert!(matches!(
             q.order,
             Order::Score(Scoring {
                 embeddings: true,
+                ..
+            })
+        ));
+        let (q, mode) = parse(&["-q", "cat", "--grid"]).unwrap();
+        assert!(matches!(mode, Mode::Pick(View::Grid, End::Newline)));
+        assert!(matches!(
+            q.order,
+            Order::Score(Scoring {
+                embeddings: false,
                 ..
             })
         ));

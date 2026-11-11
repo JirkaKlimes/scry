@@ -6,7 +6,7 @@ mod meta;
 mod models;
 mod ocr;
 mod output;
-mod scatter;
+mod pick;
 mod search;
 #[cfg(test)]
 mod testing;
@@ -23,7 +23,7 @@ use std::{
 use anyhow::{Result, anyhow};
 
 use cli::Mode;
-use scatter::Exit;
+use pick::Exit;
 
 fn main() -> ExitCode {
     match run() {
@@ -42,7 +42,7 @@ fn run() -> Result<ExitCode> {
     let (progress, skipped) = (search.progress.clone(), search.skipped);
     let printed = match mode {
         Mode::List(opts) => output::list(search, &opts)? > 0,
-        Mode::Scatter(end) => match scatter::run(search)? {
+        Mode::Pick(view, end) => match pick::run(search, view)? {
             Exit::Picked(paths) => {
                 output::paths(&paths, end)?;
                 true
