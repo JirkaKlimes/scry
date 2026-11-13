@@ -1,11 +1,15 @@
 use std::{
     borrow::Cow,
     fmt::{self, Write as _},
-    fs::OpenOptions,
+    fs::File,
     io::{self, BufWriter, IsTerminal, Write},
-    os::unix::ffi::OsStrExt,
+    os::{
+        fd::{AsFd, BorrowedFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     sync::{
+        LazyLock,
         atomic::{AtomicUsize, Ordering::Relaxed},
         mpsc::{Receiver, RecvTimeoutError, TryRecvError},
     },
@@ -20,18 +24,21 @@ use ratatui::{
     crossterm::{
         cursor::{MoveDown, MoveRight, MoveUp, RestorePosition, SavePosition},
         queue,
-        style::{Colors, Print, ResetColor, SetColors},
+        style::{Colors, Print, ResetColor, SetColors, available_color_count},
         terminal,
     },
     layout::{Position, Rect, Size},
+    style::Color,
     widgets::Widget,
 };
 use ratatui_image::{
     FontSize, Image, Resize,
-    picker::{Picker, cap_parser::QueryStdioOptions},
+    picker::{Picker, ProtocolType, cap_parser::QueryStdioOptions},
 };
 use rustix::{
     event::{PollFd, PollFlags, Timespec},
+    fs::{OFlags, fcntl_getfl},
+    stdio,
     termios::{self, OptionalActions, Termios},
 };
 
@@ -126,17 +133,17 @@ fn next(
         match hits.recv_timeout(TICK) {
             Ok(hit) => return hit.map(Some),
             Err(RecvTimeoutError::Disconnected) => return Ok(None),
-            Err(RecvTimeoutError::Timeout) if stdout_closed() => return Ok(None),
+            Err(RecvTimeoutError::Timeout) if closed(io::stdout()) => return Ok(None),
             Err(RecvTimeoutError::Timeout) => tick(),
         }
     }
 }
 
-/// Linux flags POLLERR on a pipe once its reader is gone, before a write fails. Without this
-/// check, `scry -t x | head -1` would read every image after head exits.
-fn stdout_closed() -> bool {
-    let stdout = io::stdout();
-    let mut fds = [PollFd::new(&stdout, PollFlags::empty())];
+/// The kernel flags a pipe once its reader is gone, before a write fails. macOS flags it only
+/// for a poll that asks for POLLOUT. Without this check, `scry -t x | head -1` would read every
+/// image after head exits.
+fn closed(out: impl AsFd) -> bool {
+    let mut fds = [PollFd::new(&out, PollFlags::OUT)];
     rustix::event::poll(&mut fds, Some(&Timespec::default()))
         .is_ok_and(|_| fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP))
 }
@@ -153,8 +160,8 @@ pub fn notes(progress: &Progress, skipped: Option<Skipped>) {
     let mut notes = String::new();
     if unsupported > 0 {
         notes += &format!(
-            "scry: skipped {unsupported} HEIC, AVIF, JPEG XL or RAW {}: scry cannot read these \
-             formats yet\n",
+            "scry: skipped {unsupported} {} {}: scry cannot read these formats yet\n",
+            decode::UNSUPPORTED,
             files(unsupported)
         );
     }
@@ -203,6 +210,57 @@ pub fn picker() -> Result<Picker> {
         ..Default::default()
     };
     Ok(Picker::from_query_stdio_with_options(options)?)
+}
+
+/// Gives half blocks the nearest xterm colors if the terminal has no 24-bit color, as Terminal.app
+/// before macOS 26. A terminal with 24-bit color tells it in COLORTERM.
+pub fn fit_colors(buf: &mut Buffer, area: Rect) {
+    static TRUECOLOR: LazyLock<bool> = LazyLock::new(|| available_color_count() == u16::MAX);
+    if *TRUECOLOR {
+        return;
+    }
+    for pos in area.intersection(buf.area).positions() {
+        let cell = &mut buf[pos];
+        cell.fg = xterm(cell.fg);
+        cell.bg = xterm(cell.bg);
+    }
+}
+
+/// The nearest color in the 6 x 6 x 6 cube of xterm, whose levels are 0, 95, 135, 175, 215 and 255.
+fn xterm(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    let level = |v: u8| match v {
+        0..48 => 0,
+        48..115 => 1,
+        _ => (v - 35) / 40,
+    };
+    Color::Indexed(16 + 36 * level(r) + 6 * level(g) + level(b))
+}
+
+/// The controlling terminal. A copy of a stdio fd comes first, because macOS cannot poll an open
+/// /dev/tty. A copy also needs no access to the device file, which after `su` belongs to another
+/// user.
+pub fn tty() -> io::Result<OwnedFd> {
+    let stdio = [stdio::stdin(), stdio::stdout(), stdio::stderr()];
+    if let Some(fd) = stdio.into_iter().find(|&fd| controls(fd)) {
+        return fd.try_clone_to_owned();
+    }
+    if cfg!(target_os = "macos") {
+        return Err(io::Error::other(
+            "on macOS, stdin, stdout or stderr must be the terminal",
+        ));
+    }
+    let tty = File::options().read(true).write(true).open("/dev/tty")?;
+    Ok(tty.into())
+}
+
+/// True if `fd` is the controlling terminal, open to read and write. Not tcgetsid: macOS returns
+/// a session for a terminal that is not the controlling terminal.
+fn controls(fd: BorrowedFd) -> bool {
+    termios::tcgetpgrp(fd).is_ok()
+        && fcntl_getfl(fd).is_ok_and(|flags| flags & OFlags::RWMODE == OFlags::RDWR)
 }
 
 /// Writes one record per hit: the score, the path and the text, separated by tabs. Pipes get
@@ -329,8 +387,7 @@ impl Preview {
         // The terminal answers capability queries on stdin, which may be the piped path list.
         // The walker reads that list from its own duplicate of fd 0.
         if !io::stdin().is_terminal() {
-            let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
-            rustix::stdio::dup2_stdin(&tty)?;
+            stdio::dup2_stdin(tty()?)?;
         }
         let mode = TtyMode(termios::tcgetattr(io::stdin())?);
         Ok(Self {
@@ -347,8 +404,12 @@ impl Preview {
             return Ok(());
         };
         let thumb = self.picker.new_protocol(img, cells, Resize::Fit(None))?;
-        let mut buf = Buffer::empty(Rect::from((Position::ORIGIN, thumb.size())));
-        Image::new(&thumb).render(buf.area, &mut buf);
+        let area = Rect::from((Position::ORIGIN, thumb.size()));
+        let mut buf = Buffer::empty(area);
+        Image::new(&thumb).render(area, &mut buf);
+        if self.picker.protocol_type() == ProtocolType::Halfblocks {
+            fit_colors(&mut buf, area);
+        }
         Ok(draw(out, &buf)?)
     }
 }
@@ -500,6 +561,24 @@ mod tests {
             printed(true, End::Newline, Some(0.5), b"a.png", &text),
             b"0.5\ta.png\tINV-2041\tTotal ?[2J\n"
         );
+    }
+
+    #[test]
+    fn xterm_colors_are_nearest() {
+        let cube = |r: u8, g: u8, b: u8| Color::Indexed(16 + 36 * r + 6 * g + b);
+        assert_eq!(xterm(Color::Rgb(0, 0, 0)), cube(0, 0, 0));
+        assert_eq!(xterm(Color::Rgb(255, 0, 0)), cube(5, 0, 0));
+        assert_eq!(xterm(Color::Rgb(47, 48, 114)), cube(0, 1, 1));
+        assert_eq!(xterm(Color::Rgb(115, 154, 255)), cube(2, 2, 5));
+        assert_eq!(xterm(Color::Yellow), Color::Yellow);
+    }
+
+    #[test]
+    fn pipe_without_reader_is_closed() {
+        let (reader, writer) = io::pipe().unwrap();
+        assert!(!closed(&writer));
+        drop(reader);
+        assert!(closed(&writer));
     }
 
     #[test]

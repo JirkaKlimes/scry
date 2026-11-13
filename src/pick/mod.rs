@@ -5,7 +5,6 @@ mod scatter;
 
 use std::{
     cell::RefCell,
-    fs::File,
     io::{self, Write},
     mem,
     ops::ControlFlow::{self, Break, Continue},
@@ -148,7 +147,7 @@ fn restore_on_panic() {
     }));
 }
 
-/// Points fd 0 and 1 at /dev/tty for the UI, like fzf, so the real stdout stays clean for the
+/// Points fd 0 and 1 at the terminal for the UI, like fzf, so the real stdout stays clean for the
 /// selection. Drop puts the original fds back.
 struct TtyStdio {
     stdin: OwnedFd,
@@ -157,7 +156,7 @@ struct TtyStdio {
 
 impl TtyStdio {
     fn swap() -> io::Result<Self> {
-        let tty = File::options().read(true).write(true).open("/dev/tty")?;
+        let tty = output::tty()?;
         let saved = Self {
             stdin: dup(io::stdin())?,
             stdout: dup(io::stdout())?,
@@ -316,10 +315,14 @@ impl Core {
     /// frame cannot lose a kitty image.
     fn draw_image(&self, frame: &mut Frame, image: &Protocol, area: Rect) {
         frame.render_widget(Image::new(image), area);
-        if self.graphics == Graphics::Cells {
-            kitty::anchor(frame.buffer_mut(), area);
-            let transmit = kitty::transmit(frame.buffer_mut(), area);
-            self.transmits.borrow_mut().extend(transmit);
+        match self.graphics {
+            Graphics::Cells => {
+                kitty::anchor(frame.buffer_mut(), area);
+                let transmit = kitty::transmit(frame.buffer_mut(), area);
+                self.transmits.borrow_mut().extend(transmit);
+            }
+            Graphics::Text => output::fit_colors(frame.buffer_mut(), area),
+            Graphics::Layered => {}
         }
     }
 

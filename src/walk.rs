@@ -32,7 +32,7 @@ pub struct WalkOpts {
 
 pub enum Found {
     Image(PathBuf),
-    /// A HEIC, RAW or other image that scry cannot read yet.
+    /// An image in a format that scry cannot read.
     Unsupported,
     /// A file or directory that scry cannot read.
     Error,
@@ -78,10 +78,11 @@ pub fn candidates(source: Source, opts: WalkOpts) -> Result<Walk> {
         Source::Paths(paths) => {
             let mut dirs = Vec::new();
             for path in paths {
-                if fs::metadata(&path)
-                    .with_context(|| clean_path(&path).to_string())?
-                    .is_dir()
-                {
+                let context = || clean_path(&path).to_string();
+                if fs::metadata(&path).with_context(context)?.is_dir() {
+                    // A directory that scry cannot list, as macOS guards ~/Documents, stops scry
+                    // here with the reason.
+                    fs::read_dir(&path).with_context(context)?;
                     dirs.push(path);
                 } else if let Some(found) = wanted(&path, &opts.globs) {
                     tx.send(found).expect("the receiver is in this function");
@@ -147,7 +148,11 @@ fn walk(dirs: &[PathBuf], opts: WalkOpts, tx: Sender<Found>) {
         .hidden(!opts.hidden)
         .filter_entry(move |e| {
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
-            !globs.matched(relative(e), is_dir).is_ignore()
+            // The Photos library of macOS holds several copies of each photo, and macOS guards
+            // it. As a walk root, it is still searched.
+            let photos = is_dir
+                && (e.path().extension()).is_some_and(|x| x.eq_ignore_ascii_case("photoslibrary"));
+            !photos && !globs.matched(relative(e), is_dir).is_ignore()
         })
         .build_parallel();
     thread::spawn(move || {
@@ -207,7 +212,8 @@ mod tests {
             ".hidden/d.gif",
             ".e.jpg",
             "ignored/f.bmp",
-            "IMG_1.HEIC",
+            "IMG_1.CR2",
+            "Photos Library.photoslibrary/originals/g.jpg",
             "sub/raw.nef",
         ] {
             let path = root.join(f);
@@ -337,7 +343,7 @@ mod tests {
             0
         );
         assert_eq!(
-            unsupported(Source::Paths(vec![root.join("IMG_1.HEIC")]), &[]),
+            unsupported(Source::Paths(vec![root.join("IMG_1.CR2")]), &[]),
             1
         );
     }

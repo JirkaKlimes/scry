@@ -21,10 +21,10 @@ scry prints paths, so it works in pipelines. It runs on your CPU, and after a on
 
 ## Install
 
-Linux only for now (x86_64 and aarch64).
+Linux and macOS, on x86_64 and aarch64.
 
 ```sh
-# Static binary, installed to ~/.local/bin
+# Prebuilt binary, installed to ~/.local/bin
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/JirkaKlimes/scry/releases/latest/download/scry-cli-installer.sh | sh
 
 # With cargo-binstall
@@ -33,13 +33,13 @@ cargo binstall scry-cli
 # From source (Rust 1.94 or newer)
 cargo install --locked scry-cli
 
-# With Nix
+# With Nix, on Linux or Apple silicon
 nix run github:JirkaKlimes/scry -- -q "a red bicycle" ~/Pictures
 ```
 
 The crate is `scry-cli`, because `scry` is taken on crates.io. The binary is `scry`.
 
-The first `-q` search downloads the SigLIP 2 model (about 500 MB), and `-l` needs only its image part (about 190 MB). The first `-t` or `-o` search downloads the OCR models (about 12 MB). scry checks each model against a pinned SHA-256 hash and keeps it in `~/.cache/scry`, or in `$SCRY_CACHE`.
+The first `-q` search downloads the SigLIP 2 model (about 500 MB), and `-l` needs only its image part (about 190 MB). The first `-t` or `-o` search downloads the OCR models (about 12 MB). scry checks each model against a pinned SHA-256 hash and keeps it in its cache directory: `$XDG_CACHE_HOME/scry` (usually `~/.cache/scry`) on Linux, `~/Library/Caches/scry` on macOS, or `$SCRY_CACHE`.
 
 ## Examples
 
@@ -69,11 +69,11 @@ scry -o -t 'INV-\d{4}' ~/scans
 # The receipts, newest first: choose by meaning, then sort by date
 scry -q "a receipt" --min 0.01 ~/Documents | scry --order newest
 
-# Pick images by eye and open them
+# Pick images by eye and open them. On macOS, use open, not xdg-open.
 scry -s -0 -q "a receipt" ~/Downloads | xargs -0 -r -n1 xdg-open
 
 # Read NUL-separated paths from another tool
-fd -0 -e jpg . ~/Pictures | scry -0 -t invoice | xargs -0 cp -t ~/invoices
+fd -0 -e jpg . ~/Pictures | scry -0 -t invoice | xargs -0 -I{} cp {} ~/invoices
 ```
 
 ## Options
@@ -170,7 +170,7 @@ When the grid opens, and after each page change, the first image of the page is 
 
 ### Terminals
 
-kitty, Ghostty, WezTerm, foot and other terminals with sixel support show full-resolution images. Other terminals get Unicode half blocks, at low resolution. kitty and Ghostty read the images from shared memory when scry runs on the same computer, which keeps both modes fast, also in tmux. In tmux, scry turns on `allow-passthrough` for its own pane.
+kitty, Ghostty, iTerm2, WezTerm, foot and other terminals with sixel support show full-resolution images. Other terminals get Unicode half blocks, at low resolution. kitty and Ghostty read the images from shared memory when scry runs on the same computer, which keeps both modes fast, also in tmux. In tmux, scry turns on `allow-passthrough` for its own pane.
 
 In both modes, the selected image has a yellow edge and a white hint letter. A marked image has a green edge and a check mark. In kitty and Ghostty, the edge colors follow the terminal palette. With half blocks, the edge is a ring of half blocks. With sixel and iTerm2 images, the edge stays gray, so the white hint letter and the status line show the selection.
 
@@ -180,7 +180,7 @@ scry runs the fast filters first, and the slow ones only on the images that are 
 
 scry has no vector database. It compares the query with each candidate directly, which is exact and works with all filters.
 
-The cache, `~/.cache/scry/cache.redb`, keeps the embeddings, OCR text and metadata of each file until the file changes. The first search over a folder is slow: on an 8-core laptop CPU (Ryzen 9 8945HS), scry embeds or reads the text of about 8 to 10 images per second. Later searches process only new or changed images, and take well under a second.
+The cache, `cache.redb` in the cache directory, keeps the embeddings, OCR text and metadata of each file until the file changes. The first search over a folder is slow: on an 8-core laptop CPU (Ryzen 9 8945HS), scry embeds or reads the text of about 8 to 10 images per second. Later searches process only new or changed images, and take well under a second.
 
 ## Scores
 
@@ -193,16 +193,16 @@ The probabilities are small. A correct image for an English description usually 
 ## FAQ
 
 **Which formats does scry read?**
-JPEG, PNG, GIF, WebP, BMP and TIFF. Not HEIC, AVIF, JPEG XL or camera RAW yet. scry counts the files that it skips and tells you at the end. It also skips images too large to decode safely (more than 256 MiB of pixels).
+JPEG, PNG, GIF, WebP, BMP and TIFF. On macOS also HEIC, AVIF and JPEG XL, through the image decoder of macOS. Not camera RAW yet, and not HEIC, AVIF or JPEG XL on Linux. scry counts the files that it skips and tells you at the end. It also skips images too large to decode safely (more than 256 MiB of pixels).
 
 **Why does `-t` not find a text that I can see?**
 Use `-o` to see the text that scry reads. OCR can read words in an order that you do not expect, or read a letter wrong. A meme with "ROAD TRIP" on two lines can read as `O ROAD IH TRIP`, so `-t 'road.*trip'` finds it and `-t 'road trip'` does not. OCR reads only Latin script for now.
 
 **Why are some images missing?**
-By default, scry skips hidden files and the paths in `.gitignore`. Use `--hidden` and `--no-ignore` to include them. scry follows symbolic links to images, but not to directories.
+By default, scry skips hidden files and the paths in `.gitignore`. Use `--hidden` and `--no-ignore` to include them. scry also skips the Photos library of macOS, which holds several copies of each photo. To search it, give its path. scry follows symbolic links to images, but not to directories.
 
 **How do I clear the cache, or use scry without internet?**
-Delete `~/.cache/scry/cache.redb` to clear the cache. To use scry on a computer without internet, copy `~/.cache/scry/models` from a computer where scry downloaded the models.
+Delete `cache.redb` in the [cache directory](#install) to clear the cache. To use scry on a computer without internet, copy the `models` directory from the cache directory of a computer where scry downloaded the models.
 
 ## Support
 

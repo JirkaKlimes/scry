@@ -13,19 +13,32 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::guard;
 
+#[cfg(target_os = "macos")]
+mod imageio;
+
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"];
 
-/// HEIC, AVIF, JPEG XL and camera RAW images, which scry cannot decode yet.
-const UNSUPPORTED_EXTS: &[&str] = &[
-    "heic", "heif", "avif", "jxl", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
-];
+/// HEIC, AVIF and JPEG XL, which scry reads through ImageIO on macOS.
+const IMAGEIO_EXTS: &[&str] = &["heic", "heif", "avif", "jxl"];
+
+/// Camera RAW images, which scry cannot decode yet.
+const RAW_EXTS: &[&str] = &["dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"];
+
+const IMAGEIO: bool = cfg!(target_os = "macos");
+
+/// The formats that `is_unsupported` finds, for messages.
+pub const UNSUPPORTED: &str = if IMAGEIO {
+    "camera RAW"
+} else {
+    "HEIC, AVIF, JPEG XL or camera RAW"
+};
 
 pub fn is_image(path: &Path) -> bool {
-    has_ext(path, IMAGE_EXTS)
+    has_ext(path, IMAGE_EXTS) || IMAGEIO && has_ext(path, IMAGEIO_EXTS)
 }
 
 pub fn is_unsupported(path: &Path) -> bool {
-    has_ext(path, UNSUPPORTED_EXTS)
+    has_ext(path, RAW_EXTS) || !IMAGEIO && has_ext(path, IMAGEIO_EXTS)
 }
 
 fn has_ext(path: &Path, exts: &[&str]) -> bool {
@@ -61,15 +74,22 @@ pub fn check(md: &fs::Metadata) -> Result<u64> {
 pub struct Header {
     width: u32,
     height: u32,
-    format: ImageFormat,
+    orientation: Orientation,
+    format: Format,
     decoded: u64,
     pub exif: Option<exif::Exif>,
+}
+
+enum Format {
+    Image(ImageFormat),
+    #[cfg(target_os = "macos")]
+    ImageIo,
 }
 
 impl Header {
     /// Width and height as viewers show the image.
     pub fn size(&self) -> (u32, u32) {
-        match self.orientation() {
+        match self.orientation {
             Orientation::Rotate90
             | Orientation::Rotate270
             | Orientation::Rotate90FlipH
@@ -78,24 +98,12 @@ impl Header {
         }
     }
 
-    fn orientation(&self) -> Orientation {
-        self.exif
-            .as_ref()
-            .and_then(|e| {
-                e.get_field(Tag::Orientation, In::PRIMARY)?
-                    .value
-                    .get_uint(0)
-            })
-            .and_then(|o| Orientation::from_exif(o.try_into().ok()?))
-            .unwrap_or(Orientation::NoTransforms)
-    }
-
     /// The most memory that a decoder needs. zune-jpeg holds the whole file, and for a
     /// progressive JPEG also 16-bit coefficients for each sample. Other decoders need about one
     /// more copy of the pixels.
     fn peak(&self, file: u64) -> u64 {
         match self.format {
-            ImageFormat::Jpeg => file + 3 * self.decoded,
+            Format::Image(ImageFormat::Jpeg) => file + 3 * self.decoded,
             _ => 2 * self.decoded,
         }
     }
@@ -116,16 +124,28 @@ pub fn load(path: &Path, side: u32) -> Result<DynamicImage> {
             "too large: {} MiB decoded",
             header.decoded >> 20
         );
-        let (format, orientation) = (header.format, header.orientation());
         let charge = BUDGET.charge(header.peak(file.len));
-        // The EXIF of a TIFF holds a copy of the file.
-        drop(header);
         file.rewind()?;
-        let decoder = ImageReader::with_format(BufReader::new(file), format).into_decoder()?;
-        // Turn the small copy: a square fit gives the same result before and after a turn.
-        let mut image = shrink(DynamicImage::from_decoder(decoder)?, side);
+        let image = match header.format {
+            Format::Image(format) => {
+                let orientation = header.orientation;
+                // The EXIF of a TIFF holds a copy of the file.
+                drop(header);
+                let decoder =
+                    ImageReader::with_format(BufReader::new(file), format).into_decoder()?;
+                // Turn the small copy: a square fit gives the same result before and after a turn.
+                let mut image = shrink(DynamicImage::from_decoder(decoder)?, side);
+                image.apply_orientation(orientation);
+                image
+            }
+            #[cfg(target_os = "macos")]
+            Format::ImageIo => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                imageio::load(&bytes, side.min(header.width.max(header.height)))?
+            }
+        };
         drop(charge);
-        image.apply_orientation(orientation);
         Ok(image)
     })
 }
@@ -155,7 +175,12 @@ fn read_header(file: &mut Bounded, path: &Path) -> Result<Header> {
 
 /// `whole` tells whether `bytes` is the whole file, so that broken EXIF is final.
 fn parse(bytes: &[u8], path: &Path, whole: bool) -> Result<Header> {
-    let format = image::guess_format(bytes).or_else(|_| ImageFormat::from_path(path))?;
+    let format = image::guess_format(bytes).or_else(|_| ImageFormat::from_path(path));
+    #[cfg(target_os = "macos")]
+    if !format.as_ref().is_ok_and(ImageFormat::reading_enabled) {
+        return parse_imageio(bytes, whole);
+    }
+    let format = format?;
     let mut decoder = ImageReader::with_format(Cursor::new(bytes), format).into_decoder()?;
     let (width, height) = decoder.dimensions();
     let exif = match read_exif(&mut decoder, format, bytes) {
@@ -167,10 +192,39 @@ fn parse(bytes: &[u8], path: &Path, whole: bool) -> Result<Header> {
     Ok(Header {
         width,
         height,
-        format,
+        orientation: orientation(exif.as_ref()),
+        format: Format::Image(format),
         decoded: decoder.total_bytes(),
         exif,
     })
+}
+
+/// ImageIO and the HEIF parser of the EXIF reader need the whole file.
+#[cfg(target_os = "macos")]
+fn parse_imageio(bytes: &[u8], whole: bool) -> Result<Header> {
+    ensure!(whole, "not the whole file");
+    let (width, height, orientation) = imageio::info(bytes)?;
+    Ok(Header {
+        width,
+        height,
+        orientation,
+        format: Format::ImageIo,
+        decoded: 4 * u64::from(width) * u64::from(height),
+        // Broken EXIF only costs the EXIF filters.
+        exif: exif::Reader::new()
+            .read_from_container(&mut Cursor::new(bytes))
+            .ok(),
+    })
+}
+
+fn orientation(exif: Option<&exif::Exif>) -> Orientation {
+    exif.and_then(|e| {
+        e.get_field(Tag::Orientation, In::PRIMARY)?
+            .value
+            .get_uint(0)
+    })
+    .and_then(|o| Orientation::from_exif(o.try_into().ok()?))
+    .unwrap_or(Orientation::NoTransforms)
 }
 
 /// A TIFF file is itself the structure that EXIF uses.
@@ -270,7 +324,7 @@ impl Drop for Charge<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::symlink, sync::mpsc, thread, time::Duration};
+    use std::{os::unix::fs::symlink, process::Command, sync::mpsc, thread, time::Duration};
 
     use exif::{Field, Value};
 
@@ -285,6 +339,14 @@ mod tests {
             value: Value::Short(vec![6]),
         };
         jpeg_with_exif(width, height, &[orientation])
+    }
+
+    #[test]
+    fn only_macos_reads_heic() {
+        let heic = Path::new("IMG_1.HEIC");
+        assert_eq!(is_image(heic), cfg!(target_os = "macos"));
+        assert_eq!(is_unsupported(heic), !cfg!(target_os = "macos"));
+        assert!(is_unsupported(Path::new("IMG_2.CR2")));
     }
 
     #[test]
@@ -343,14 +405,9 @@ mod tests {
             "not a regular file"
         );
         let fifo = Temp::path("fifo.png");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &*fifo,
-            rustix::fs::FileType::Fifo,
-            Mode::RUSR | Mode::WUSR,
-            0,
-        )
-        .unwrap();
+        // rustix has no mkfifo for macOS.
+        let mkfifo = Command::new("mkfifo").arg(&*fifo).status().unwrap();
+        assert!(mkfifo.success());
         assert_eq!(
             header(&fifo).err().unwrap().to_string(),
             "not a regular file"

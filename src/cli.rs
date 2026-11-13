@@ -35,10 +35,11 @@ const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
     name = "scry",
     version,
     about = "Find images by what they show, the text in them, or their metadata.",
+    max_term_width = 100,
     group(ArgGroup::new("rank").args(["query", "like"])),
     after_help = "\
-RANGE is A..B, A.., ..B or A. Both ends are inclusive. A date (2024, 2024-06, 2024-06-15) covers
-the whole period. An age (12h, 7d, 2w, 3mo, 1y) counts back from now: --date 7d.. is the last 7
+RANGE is A..B, A.., ..B or A. Both ends are inclusive. A date (2024, 2024-06, 2024-06-15) covers \
+the whole period. An age (12h, 7d, 2w, 3mo, 1y) counts back from now: --date 7d.. is the last 7 \
 days, ..1y is older than a year.
 
 Examples:
@@ -47,7 +48,8 @@ Examples:
   scry -s --date 2024-07 ~/Pictures
   scry --order newest -n 1 -t error ~/Pictures/Screenshots
 
-scry keeps models and a cache in ~/.cache/scry. Set SCRY_CACHE to use another directory.
+scry keeps models and a cache in $XDG_CACHE_HOME/scry (usually ~/.cache/scry), or in \
+~/Library/Caches/scry on macOS. Set SCRY_CACHE to use another directory.
 Exit status: 0 if scry printed a path, 1 if not, 2 on error, 130 if you quit scatter or grid mode."
 )]
 struct Args {

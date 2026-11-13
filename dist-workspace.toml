@@ -5,6 +5,10 @@ members = ["cargo:."]
 cargo-dist-version = "0.34.0"
 ci = "github"
 installers = ["shell"]
-targets = ["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
 install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
 install-updater = false
+
+# GitHub retires its Intel macOS runners. An arm64 runner cross-compiles the x86_64 binary.
+[dist.github-custom-runners]
+x86_64-apple-darwin = "macos-15"

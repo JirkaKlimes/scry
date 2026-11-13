@@ -19,7 +19,7 @@
       inherit (nixpkgs) lib;
       forAllSystems =
         f:
-        lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (
+        lib.genAttrs [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
           system:
           f (
             import nixpkgs {
