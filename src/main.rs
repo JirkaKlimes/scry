@@ -42,7 +42,7 @@ fn run() -> Result<ExitCode> {
     let (progress, skipped) = (search.progress.clone(), search.skipped);
     let printed = match mode {
         Mode::List(opts) => output::list(search, &opts)? > 0,
-        Mode::Pick(view, end) => match pick::run(search, view)? {
+        Mode::Pick { view, binds, end } => match pick::run(search, view, binds)? {
             Exit::Picked(paths) => {
                 output::paths(&paths, end)?;
                 true
