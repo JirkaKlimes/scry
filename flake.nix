@@ -60,6 +60,10 @@
             cargoLock.lockFile = ./Cargo.lock;
             # CI runs the tests. Here they would only add a second full build.
             doCheck = false;
+            # wgpu loads libvulkan.so.1 at run time, and NixOS has no global copy.
+            postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              patchelf --add-rpath ${lib.makeLibraryPath [ pkgs.vulkan-loader ]} $out/bin/scry
+            '';
             meta = {
               inherit (manifest) description;
               homepage = manifest.repository;
@@ -83,6 +87,10 @@
               exec cargo run --release --quiet --manifest-path "$SCRY_ROOT/Cargo.toml" -- "$@"
             '')
           ];
+          # wgpu finds libvulkan.so.1 here when the scry wrapper runs the working tree.
+          LD_LIBRARY_PATH = lib.optionalString pkgs.stdenv.hostPlatform.isLinux (
+            lib.makeLibraryPath [ pkgs.vulkan-loader ]
+          );
           shellHook = ''
             export SCRY_ROOT="$PWD"
           '';

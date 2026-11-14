@@ -55,6 +55,8 @@ Examples:
 
 scry keeps models and a cache in $XDG_CACHE_HOME/scry (usually ~/.cache/scry), or in \
 ~/Library/Caches/scry on macOS. Set SCRY_CACHE to use another directory.
+scry runs the image model on a fast GPU if it finds one: Vulkan on Linux, Metal on macOS. Set \
+SCRY_DEVICE=cpu to use only the CPU, or SCRY_DEVICE=gpu to use any GPU, also a slow one.
 Exit status: 0 if scry printed a path, 1 if not, 2 on error, 130 if you quit scatter or grid mode."
 )]
 struct Args {
