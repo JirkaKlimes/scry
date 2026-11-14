@@ -326,11 +326,23 @@ impl Scatter {
 }
 
 impl Board for Scatter {
+    fn push(&mut self, hit: Hit) {
+        self.feed.push(hit);
+    }
+
+    /// Starts a new pile, at the same speed and size.
+    fn clear(&mut self, order: &Order<()>) {
+        *self = Self {
+            interval: self.interval,
+            size: self.size,
+            ..Self::new(order)
+        };
+    }
+
     fn tick(&mut self, core: &mut Core, elapsed: Duration) -> Result<Outcome> {
         if !self.paused() {
             self.clock += elapsed;
         }
-        core.drain(|hit| self.feed.push(hit))?;
         for card in self.layout.fit(core.bounds) {
             self.feed.retry(card.hit);
         }
@@ -441,10 +453,12 @@ impl Board for Scatter {
     fn keys(&self) -> Span<'static> {
         match self.state {
             State::Paused(_) => {
-                "PAUSED  ←/→ step · a-z select · A-Z zoom · tab mark · enter pick".yellow()
+                "PAUSED  ←/→ step · a-z select · A-Z zoom · tab mark · enter pick · * similar"
+                    .yellow()
             }
             State::Running => {
-                "space pause · ← back · enter pick · +/- speed · [/] size · esc quit".dim()
+                "space pause · ← back · enter pick · / search · +/- speed · [/] size · esc quit"
+                    .dim()
             }
         }
     }

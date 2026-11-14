@@ -55,7 +55,8 @@ pub enum Order<S = Scoring> {
 pub struct Scoring {
     pub rank: Rank,
     pub min: Option<f32>,
-    /// The best hits carry their image embedding, so scatter mode can spread out look-alikes.
+    /// Hits carry their image embedding, so a picker can rank them again and spread out
+    /// look-alikes.
     pub embeddings: bool,
 }
 
@@ -70,6 +71,7 @@ pub enum DateOrder {
     Oldest,
 }
 
+#[derive(Clone)]
 pub struct Hit {
     pub path: PathBuf,
     pub score: Option<f32>,
@@ -117,6 +119,66 @@ impl Search {
         let (done, found) = (&self.progress.done, &self.progress.found);
         format!("{}/{} {verb}", done.load(Relaxed), found.load(Relaxed))
     }
+
+    /// Embeds images on a background thread, for a picker that ranks its hits again. Each answer
+    /// carries the number that came with its path, and `None` for an image that cannot be read.
+    /// An error ends the thread: the next images would fail the same way.
+    pub fn embed(&self, embedder: ImageEmbedder) -> (Sender<(usize, PathBuf)>, Receiver<Embedded>) {
+        let (tx, paths) = mpsc::channel::<(usize, PathBuf)>();
+        let (done, rx) = mpsc::channel();
+        let (cache, progress) = (self.cache.clone(), self.progress.clone());
+        thread::spawn(move || {
+            rten::thread_pool().run(move || {
+                // False once nobody waits for the answers.
+                let answer = |i, embedding: Result<Vec<f32>>| {
+                    if embedding.is_err() {
+                        progress.errors.fetch_add(1, Relaxed);
+                    }
+                    done.send(Ok((i, embedding.ok().map(Arc::from)))).is_ok()
+                };
+                for chunk in ready_chunks(&paths, CHUNK) {
+                    let mut keys = Vec::new();
+                    for (i, path) in chunk {
+                        match fs::metadata(&path) {
+                            Ok(md) => keys.push((i, Key::new(&path, &md))),
+                            Err(e) => _ = answer(i, Err(e.into())),
+                        }
+                    }
+                    let readable: Vec<&Key> = keys.iter().map(|(_, key)| key).collect();
+                    let embedded = match embeddings(&embedder, &cache, &readable) {
+                        Ok(embedded) => embedded,
+                        Err(e) => {
+                            let _ = done.send(Err(e));
+                            return;
+                        }
+                    };
+                    for ((i, _), embedding) in keys.iter().zip(embedded) {
+                        if !answer(*i, embedding) {
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+        (tx, rx)
+    }
+}
+
+/// An answer of `Search::embed`.
+pub type Embedded = Result<(usize, Option<Arc<[f32]>>)>;
+
+#[cfg(test)]
+impl Search {
+    /// A search that found nothing.
+    pub fn empty() -> Self {
+        Self {
+            hits: mpsc::channel().1,
+            progress: Arc::default(),
+            order: Order::Found,
+            skipped: None,
+            cache: Arc::new(Cache::disabled()),
+        }
+    }
 }
 
 /// The caller can stop before the search ends, so store the results so far.
@@ -131,10 +193,6 @@ const CHUNK: usize = 32;
 
 /// Images shrink to fit this square before embedding, so a chunk of large images stays small.
 const EMBED_SIDE: u32 = 1024;
-
-/// Scatter mode spreads out look-alikes only among the best hits, so only those get their
-/// embedding.
-const EMBEDDED: usize = 2048;
 
 /// Device and inode.
 type FileId = (u64, u64);
@@ -210,13 +268,16 @@ fn counted(found: Receiver<Found>, progress: Arc<Progress>) -> Receiver<PathBuf>
 struct Ranker {
     embedder: ImageEmbedder,
     target: Target,
+    /// The --like image, which does not rank against itself.
+    exclude: Option<FileId>,
     min: Option<f32>,
     embeddings: bool,
 }
 
-enum Target {
+/// What a score compares each image embedding with.
+pub enum Target {
     Text { query: Vec<f32>, not: Vec<Vec<f32>> },
-    Like { image: Vec<f32>, id: FileId },
+    Like(Vec<f32>),
 }
 
 impl Ranker {
@@ -229,25 +290,27 @@ impl Ranker {
         cache: &Cache,
     ) -> Result<Self> {
         let embedder = ImageEmbedder::load()?;
-        let target = match rank {
+        let (target, exclude) = match rank {
             Rank::Text { query, not } => {
                 // Drops at the end of this block, with the 300 MB of the text model.
                 let model = TextEmbedder::default();
                 let embed = |prompt: &Prompt| cache.text_embedding(prompt, || model.embed(prompt));
-                Target::Text {
+                let target = Target::Text {
                     query: embed(&query)?,
                     not: not.iter().map(embed).collect::<Result<_>>()?,
-                }
+                };
+                (target, None)
             }
             Rank::Like(path) => {
                 let (image, id) = reference(&embedder, cache, &path)
                     .with_context(|| format!("--like {}", clean_path(&path)))?;
-                Target::Like { image, id }
+                (Target::Like(image), Some(id))
             }
         };
         Ok(Self {
             embedder,
             target,
+            exclude,
             min,
             embeddings,
         })
@@ -262,7 +325,7 @@ impl Ranker {
 
 impl Target {
     /// None when the image is closer to a negative than to the query.
-    fn score(&self, image: &[f32]) -> Option<f32> {
+    pub fn score(&self, image: &[f32]) -> Option<f32> {
         match self {
             Target::Text { query, not } => {
                 let cos = embed::cos(image, query);
@@ -270,15 +333,8 @@ impl Target {
                     .all(|n| embed::cos(image, n) <= cos)
                     .then(|| embed::score(cos))
             }
-            Target::Like {
-                image: reference, ..
-            } => Some(embed::cos(image, reference)),
+            Target::Like(reference) => Some(embed::cos(image, reference)),
         }
-    }
-
-    /// The --like image does not rank against itself.
-    fn excludes(&self, id: FileId) -> bool {
-        matches!(self, Target::Like { id: reference, .. } if *reference == id)
     }
 }
 
@@ -367,11 +423,7 @@ impl Engine {
                 let scored = self.gather(&paths, |chunk| {
                     self.rank(ranker, self.admit(chunk, false, &mut seen))
                 })?;
-                let mut best = best_first(scored);
-                if ranker.embeddings {
-                    self.embed_best(&mut best);
-                }
-                self.send_sorted(best, sink);
+                self.send_sorted(best_first(scored), sink);
             }
             Order::Date(order) => {
                 let mut cands =
@@ -448,27 +500,21 @@ impl Engine {
     }
 
     fn rank(&self, ranker: &Ranker, mut cands: Vec<Cand>) -> Result<Vec<(f32, Cand)>> {
-        cands.retain(|c| !ranker.target.excludes(c.id));
+        cands.retain(|c| ranker.exclude != Some(c.id));
         let keys: Vec<&Key> = cands.iter().map(|c| &c.key).collect();
         let embeddings = embeddings(&ranker.embedder, &self.cache, &keys)?;
         let scored = cands
             .into_iter()
             .zip(embeddings)
-            .filter_map(|(c, embedding)| {
-                let score = ranker.score(&self.ok(embedding)?)?;
+            .filter_map(|(mut c, embedding)| {
+                let embedding = self.ok(embedding)?;
+                let score = ranker.score(&embedding)?;
+                if ranker.embeddings {
+                    c.hit.embedding = Some(embedding.into());
+                }
                 Some((score, c))
             });
         Ok(scored.collect())
-    }
-
-    /// Reads the embeddings back from the cache, so no other hit holds one until the sort. The
-    /// embeddings of this run can still wait in the write queue.
-    fn embed_best(&self, best: &mut [Cand]) {
-        self.cache.flush();
-        let view = self.cache.view();
-        for c in best.iter_mut().take(EMBEDDED) {
-            c.hit.embedding = view.embedding(&c.key).map(Arc::from);
-        }
     }
 
     fn read_text(&self, cands: Vec<Cand>) -> Vec<Cand> {

@@ -1,11 +1,11 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     io,
     ops::{
         ControlFlow::{Break, Continue},
         Range,
     },
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -25,7 +25,7 @@ use super::{
     prefetch::{Prefetch, Shape, Thumb},
     protocol,
 };
-use crate::search::Hit;
+use crate::search::{Hit, Order};
 
 /// The aspect of most photos.
 const PHOTO: f32 = 3.0 / 2.0;
@@ -45,11 +45,11 @@ pub struct Grid {
     selected: usize,
     /// `None` while no tile fits the terminal.
     geometry: Option<Geometry>,
-    /// Thumbnails for the page in view and the pages next to it, by hit index. A failed one
-    /// stays, so a broken image decodes only once.
-    thumbs: HashMap<usize, Loading<Thumb>>,
-    /// The images on screen, by hit index.
-    images: HashMap<usize, Protocol>,
+    /// Thumbnails for the page in view and the pages next to it. A failed one stays, so a
+    /// broken image decodes only once. By path, so a new ranking keeps the ones it shows again.
+    thumbs: HashMap<PathBuf, Loading<Thumb>>,
+    /// The images on screen.
+    images: HashMap<PathBuf, Protocol>,
     shown: Scene,
 }
 
@@ -96,28 +96,30 @@ impl Grid {
     /// and drops the others.
     fn request(&mut self, prefetch: &Prefetch, geometry: Geometry) {
         let page = self.page(geometry);
-        let near = page.start.saturating_sub(geometry.len())..page.start + 2 * geometry.len();
+        let start = page.start.saturating_sub(geometry.len());
+        let end = (page.start + 2 * geometry.len()).min(self.hits.len());
+        let path = |i: usize| self.hits[i].path.as_path();
+        let near: HashSet<&Path> = (start..end).map(path).collect();
         // The page in view first, then the next page, then the page before.
-        let next: Vec<usize> = (page.start..near.end)
-            .chain(near.start..page.start)
-            .filter(|&i| i < self.hits.len())
-            .filter(|i| {
+        let next: Vec<&Path> = (page.start..end)
+            .chain(start..page.start)
+            .map(path)
+            .filter(|p| {
                 !matches!(
-                    self.thumbs.get(i),
+                    self.thumbs.get(*p),
                     Some(Loading::Ready(_) | Loading::Failed)
                 )
             })
             .take(LOADING)
             .collect();
-        self.thumbs.retain(|i, thumb| match thumb {
-            Loading::Pending(_) => next.contains(i),
-            Loading::Ready(_) => near.contains(i),
+        self.thumbs.retain(|p, thumb| match thumb {
+            Loading::Pending(_) => next.contains(&p.as_path()),
+            Loading::Ready(_) => near.contains(p.as_path()),
             Loading::Failed => true,
         });
-        for i in next {
-            if let Entry::Vacant(entry) = self.thumbs.entry(i) {
-                let path = self.hits[i].path.clone();
-                let thumb = prefetch.thumb(path, Shape::Fill(geometry.tile));
+        for p in next {
+            if let Entry::Vacant(entry) = self.thumbs.entry(p.to_owned()) {
+                let thumb = prefetch.thumb(p.to_owned(), Shape::Fill(geometry.tile));
                 entry.insert(Loading::Pending(thumb));
             }
         }
@@ -135,8 +137,18 @@ impl Grid {
 }
 
 impl Board for Grid {
+    fn push(&mut self, hit: Hit) {
+        self.hits.push(hit);
+    }
+
+    fn clear(&mut self, _: &Order<()>) {
+        self.hits.clear();
+        self.selected = 0;
+        // Sixel and iTerm2 images of the old order stay on screen without a clear.
+        self.shown = Scene::default();
+    }
+
     fn tick(&mut self, core: &mut Core, _: Duration) -> Result<Outcome> {
-        core.drain(|hit| self.hits.push(hit))?;
         if !core.searching && self.hits.is_empty() {
             return Ok(Break(Exit::Empty));
         }
@@ -157,8 +169,8 @@ impl Board for Grid {
         let Some(geometry) = geometry else {
             return Ok(Continue(()));
         };
-        let page = self.page(geometry);
-        self.images.retain(|i, _| page.contains(i));
+        let page: HashSet<&Path> = self.page(geometry).map(|i| &*self.hits[i].path).collect();
+        self.images.retain(|path, _| page.contains(path.as_path()));
         for thumb in self.thumbs.values_mut() {
             thumb.poll(Some);
         }
@@ -207,15 +219,16 @@ impl Board for Grid {
         };
         if core.zoom.is_none() {
             for i in self.page(geometry) {
-                let Some(Loading::Ready(thumb)) = self.thumbs.get(&i) else {
+                let path = &self.hits[i].path;
+                let Some(Loading::Ready(thumb)) = self.thumbs.get(path) else {
                     continue;
                 };
-                if self.images.contains_key(&i) {
+                if self.images.contains_key(path) {
                     continue;
                 }
                 match protocol(&core.picker, &core.search.progress, thumb.clone()) {
-                    Some(image) => _ = self.images.insert(i, image),
-                    None => _ = self.thumbs.insert(i, Loading::Failed),
+                    Some(image) => _ = self.images.insert(path.clone(), image),
+                    None => _ = self.thumbs.insert(path.clone(), Loading::Failed),
                 }
             }
         }
@@ -237,10 +250,10 @@ impl Board for Grid {
             let rect = geometry.tile(core.bounds, n);
             let path = &self.hits[i].path;
             let color = core.edge(path, i == self.selected);
-            if let Some(image) = self.images.get(&i) {
+            if let Some(image) = self.images.get(path) {
                 core.draw_image(frame, image, rect);
                 core.tint(frame, rect, color);
-            } else if matches!(self.thumbs.get(&i), Some(Loading::Failed)) {
+            } else if matches!(self.thumbs.get(path), Some(Loading::Failed)) {
                 frame.render_widget(Block::bordered().border_style(color), rect);
                 let row = rect.centered_vertically(Constraint::Length(1));
                 frame.render_widget(Line::from("cannot open").centered().dim(), row);
@@ -271,7 +284,8 @@ impl Board for Grid {
     }
 
     fn keys(&self) -> Span<'static> {
-        "a-z select · A-Z zoom · tab mark · enter pick · ←/→ page · esc quit".dim()
+        "a-z select · A-Z zoom · tab mark · enter pick · ←/→ page · / search · * similar · esc quit"
+            .dim()
     }
 }
 

@@ -18,14 +18,18 @@ use crate::{
     embed::Prompt,
     meta::{self, MetaFilter, Range},
     output::{self, End, ListOpts, clean_path},
-    pick::View,
+    pick::{Bind, View},
     search::{DateOrder, Order, Query, Rank, Scoring},
     walk::{self, Source, WalkOpts},
 };
 
 pub enum Mode {
     List(ListOpts),
-    Pick(View, End),
+    Pick {
+        view: View,
+        binds: Vec<Bind>,
+        end: End,
+    },
 }
 
 const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
@@ -37,6 +41,7 @@ const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
     about = "Find images by what they show, the text in them, or their metadata.",
     max_term_width = 100,
     group(ArgGroup::new("rank").args(["query", "like"])),
+    group(ArgGroup::new("view").args(["scatter", "grid"])),
     after_help = "\
 RANGE is A..B, A.., ..B or A. Both ends are inclusive. A date (2024, 2024-06, 2024-06-15) covers \
 the whole period. An age (12h, 7d, 2w, 3mo, 1y) counts back from now: --date 7d.. is the last 7 \
@@ -98,7 +103,7 @@ struct Args {
     #[arg(
         short = 'o',
         long,
-        conflicts_with_all = ["scatter", "grid"],
+        conflicts_with = "view",
         help_heading = "Text in images"
     )]
     show_text: bool,
@@ -144,8 +149,19 @@ struct Args {
     scatter: bool,
 
     /// Pick images by eye from pages of thumbnails. See grid mode.
-    #[arg(long, conflicts_with = "scatter", help_heading = "Output")]
+    #[arg(long, help_heading = "Output")]
     grid: bool,
+
+    /// In scatter or grid mode, run COMMAND on the marked or selected images when you press KEY
+    /// (ctrl-a to ctrl-z, alt-a to alt-z, f1 to f12). COMMAND gets the paths as "$@"
+    /// (repeatable)
+    #[arg(
+        long,
+        value_name = "KEY:COMMAND",
+        requires = "view",
+        help_heading = "Output"
+    )]
+    bind: Vec<Bind>,
 
     /// Sort by date, newest or oldest first
     #[arg(long, value_name = "ORDER", help_heading = "Output")]
@@ -160,18 +176,13 @@ struct Args {
         short = 'S',
         long,
         requires = "rank",
-        conflicts_with_all = ["scatter", "grid"],
+        conflicts_with = "view",
         help_heading = "Output"
     )]
     score: bool,
 
     /// Show a thumbnail above each path in the terminal
-    #[arg(
-        short,
-        long,
-        conflicts_with_all = ["scatter", "grid"],
-        help_heading = "Output"
-    )]
+    #[arg(short, long, conflicts_with = "view", help_heading = "Output")]
     preview: bool,
 
     /// Separate paths with NUL instead of newline, on stdin and stdout
@@ -203,7 +214,7 @@ impl Args {
             _ => None,
         };
         let rank = rank(self.query, self.not, self.like);
-        let order = order(rank, self.order, self.min, self.scatter)?;
+        let order = order(rank, self.order, self.min, view.is_some())?;
         let end = if self.null { End::Nul } else { End::Newline };
         let query = Query {
             source: source(self.paths, end),
@@ -225,7 +236,11 @@ impl Args {
             order,
         };
         let mode = match view {
-            Some(view) => Mode::Pick(view, end),
+            Some(view) => Mode::Pick {
+                view,
+                binds: self.bind,
+                end,
+            },
             None => Mode::List(ListOpts {
                 score: self.score,
                 preview: self.preview,
@@ -270,12 +285,12 @@ fn rank(query: Option<String>, not: Vec<String>, like: Option<PathBuf>) -> Optio
     }
 }
 
-/// `scatter` makes the best hits carry their embedding.
+/// `pick` makes the hits carry their embedding, so a picker can rank them again.
 fn order(
     rank: Option<Rank>,
     date: Option<DateOrder>,
     min: Option<f32>,
-    scatter: bool,
+    pick: bool,
 ) -> Result<Order, clap::Error> {
     match (rank, date) {
         (Some(rank), None) => {
@@ -285,7 +300,7 @@ fn order(
             Ok(Order::Score(Scoring {
                 rank,
                 min,
-                embeddings: scatter,
+                embeddings: pick,
             }))
         }
         (Some(_), Some(_)) => Err(Args::command().error(
@@ -505,6 +520,11 @@ mod tests {
         assert_eq!(err(&["-s", "-o"]), ErrorKind::ArgumentConflict);
         assert_eq!(err(&["-s", "-S", "-q", "cat"]), ErrorKind::ArgumentConflict);
         assert_eq!(err(&["--grid", "-s"]), ErrorKind::ArgumentConflict);
+        assert_eq!(
+            err(&["--bind", "ctrl-d:x"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(err(&["-s", "--bind", "d:x"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--grid", "-p"]), ErrorKind::ArgumentConflict);
         assert_eq!(err(&["--grid", "-o"]), ErrorKind::ArgumentConflict);
         assert_eq!(
@@ -637,7 +657,10 @@ mod tests {
         assert!(!q.text[0].is_match("TOTAL"));
         assert_eq!(q.meta.gps, None);
         assert!(matches!(q.order, Order::Found) && !q.meta.needs_meta());
-        assert!(matches!(mode, Mode::Pick(View::Scatter, End::Nul)));
+        assert!(matches!(
+            mode,
+            Mode::Pick { view: View::Scatter, binds, end: End::Nul } if binds.is_empty()
+        ));
         let (q, _) = parse(&["-q", "cat", "-s"]).unwrap();
         assert!(matches!(
             q.order,
@@ -646,8 +669,19 @@ mod tests {
                 ..
             })
         ));
-        let (q, mode) = parse(&["-q", "cat", "--grid"]).unwrap();
-        assert!(matches!(mode, Mode::Pick(View::Grid, End::Newline)));
+        let (q, mode) = parse(&["-q", "cat", "--grid", "--bind", "ctrl-d:rm \"$@\""]).unwrap();
+        assert!(matches!(
+            mode,
+            Mode::Pick { view: View::Grid, binds, end: End::Newline } if binds[0].name == "ctrl-d"
+        ));
+        assert!(matches!(
+            q.order,
+            Order::Score(Scoring {
+                embeddings: true,
+                ..
+            })
+        ));
+        let (q, _) = parse(&["-q", "cat"]).unwrap();
         assert!(matches!(
             q.order,
             Order::Score(Scoring {

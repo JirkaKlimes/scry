@@ -21,7 +21,7 @@ pub struct Asset {
 }
 
 pub fn fetch(asset: &Asset) -> Result<PathBuf> {
-    let dir = cache::dir()?.join("models");
+    let dir = dir()?;
     let path = dir.join(asset.name);
     if path.exists() {
         return Ok(path);
@@ -55,6 +55,15 @@ pub fn fetch(asset: &Asset) -> Result<PathBuf> {
         fs::rename(&part, &path)?;
     }
     Ok(path)
+}
+
+/// True when `fetch` needs no download.
+pub fn is_downloaded(asset: &Asset) -> bool {
+    dir().is_ok_and(|dir| dir.join(asset.name).exists())
+}
+
+fn dir() -> Result<PathBuf> {
+    Ok(cache::dir()?.join("models"))
 }
 
 /// A model that fails to load was most likely damaged after its download.

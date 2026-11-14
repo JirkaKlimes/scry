@@ -80,6 +80,11 @@ pub struct ImageEmbedder {
 }
 
 impl ImageEmbedder {
+    /// True when `load` needs no download, which would print over a picker.
+    pub fn is_downloaded() -> bool {
+        models::is_downloaded(&VISION)
+    }
+
     pub fn load() -> Result<Self> {
         // Download now, so a progress bar never cuts into the scatter UI later.
         Ok(Self {
@@ -121,6 +126,16 @@ impl Prompt {
 pub struct TextEmbedder(OnceLock<(Tokenizer, Tower)>);
 
 impl TextEmbedder {
+    /// True when loading needs no download, which would print over a picker.
+    pub fn is_downloaded() -> bool {
+        models::is_downloaded(&TOKENIZER) && models::is_downloaded(&TEXT)
+    }
+
+    /// Loads the model now, not on first use.
+    pub fn load() -> Result<Self> {
+        Ok(Self(OnceLock::from(load_text()?)))
+    }
+
     /// One text per call: the int8 tower quantizes activations over the whole batch, so a text
     /// embedded together with others would get a slightly different embedding than alone.
     pub fn embed(&self, prompt: &Prompt) -> Result<Vec<f32>> {

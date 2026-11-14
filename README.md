@@ -72,6 +72,9 @@ scry -q "a receipt" --min 0.01 ~/Documents | scry --order newest
 # Pick images by eye and open them. On macOS, use open, not xdg-open.
 scry -s -0 -q "a receipt" ~/Downloads | xargs -0 -r -n1 xdg-open
 
+# Browse a folder, type / to search it, and press ctrl-d to copy the marked images
+scry --grid --bind 'ctrl-d:cp -- "$@" ~/picked/' ~/Pictures
+
 # Read NUL-separated paths from another tool
 fd -0 -e jpg . ~/Pictures | scry -0 -t invoice | xargs -0 -I{} cp {} ~/invoices
 ```
@@ -107,6 +110,7 @@ Each `PATH` is a file or a directory. With no `PATH`, scry reads image paths fro
 | **Output** | |
 | `-s, --scatter` | Pick images by eye, one at a time. See [scatter mode](#scatter-mode). |
 | `--grid` | Pick images by eye from pages of thumbnails. Not with `-s`. See [grid mode](#grid-mode). |
+| `--bind <KEY:COMMAND>` | In scatter or grid mode, run COMMAND on the marked or selected images when you press KEY. Repeatable. See [actions](#actions). |
 | `--order <ORDER>` | Sort by `--date`: `newest` or `oldest` first. Not with `-q` or `-l`. |
 | `-n, --limit <N>` | Print at most N paths, or `all`. Default: 20 with `-q` or `-l` and no `--min`, `-s` or `--grid`, else all. |
 | `-S, --score` | Print the score and a tab before each path. Needs `-q` or `-l`. |
@@ -130,6 +134,32 @@ A description can match many images. scry has two modes to pick the right one by
 
 Like fzf, both modes draw on the terminal and write only the result to stdout. So `scry -s ... | xargs ...` and `$(scry --grid ...)` work.
 
+### Search inside
+
+In both modes, you can rank the images again without a new search:
+
+- `/` opens a query line. Each key that you type ranks the images by the text, best first. `Enter` keeps the ranking, and `Esc` goes back to the ranking before.
+- `*` ranks the images by how similar they look to the selected image.
+- `Backspace` goes back to the ranking before, until the images are in the order of the search again.
+
+A ranking changes only the order. The search still chooses the images, so options like `-t`, `--date` and `--min` stay in effect. Marks stay when the ranking changes, so you can mark images from different queries and print them all with `Enter`.
+
+Without `-q` or `-l`, the first `/` or `*` starts to embed the images in the background. A ranking takes in each image when its embedding is ready, and the status line shows how many images are not ranked yet. Images in the cache are ready at once. This needs the SigLIP 2 model: if it is not downloaded yet, run a search with `-q` once.
+
+### Actions
+
+`--bind KEY:COMMAND` runs COMMAND when you press KEY. KEY is `ctrl-a` to `ctrl-z`, `alt-a` to `alt-z`, or `f1` to `f12`. Letters alone select images, `ctrl-c` quits, and terminals send `ctrl-h`, `ctrl-i`, `ctrl-j` and `ctrl-m` as other keys.
+
+COMMAND runs in `sh`, with the marked images, or else the selected image, as its arguments: `"$1"` is the first path and `"$@"` is all of them. A path never becomes part of the shell code, so any file name is safe. COMMAND runs in the background with no terminal, and the status line tells when it ends and if it failed. Use a shell alias to keep the bindings that you use often.
+
+```sh
+# ctrl-d copies the images to a folder, ctrl-x moves them to the trash
+scry --grid --bind 'ctrl-d:cp -- "$@" ~/picked/' --bind 'ctrl-x:gio trash -- "$@"' ~/Pictures
+
+# ctrl-y copies the selected image, so you can paste it in a chat or a pull request (Wayland)
+scry --grid -q "a diagram" --bind 'ctrl-y:wl-copy < "$1"' ~/Documents
+```
+
 ### Scatter mode
 
 `scry -s` shows the images one at a time, each at a different place on the screen. A new image lands on top and covers the part of the screen that has been visible longest. No image disappears while you can see a part of it, so your eye goes only to the newest one.
@@ -144,6 +174,7 @@ With `-q` or `-l`, scry scores all images before it shows the first one. Then th
 | `A` to `Z` | Show that image full screen. There, `←` and `→` go through the images, `Enter` prints it with the marked images, `Tab` marks it, and any other key goes back. |
 | `Tab` | Mark or unmark the selected image. |
 | `Enter` | Print the marked images in mark order, or else the selected image, and quit. With no selection, select the best image in view. |
+| `/`, `*`, `Backspace` | Rank by a text, rank like the selected image, or go back. The pile starts again. See [search inside](#search-inside). |
 | `+`, `-` | Show images faster or slower. |
 | `]`, `[` | Make images larger or smaller. |
 | `Esc`, `Ctrl-C` | Quit and print nothing. |
@@ -162,6 +193,7 @@ The images keep the order of the search, from left to right and top to bottom. S
 | `A` to `Z` | Select that image and show it full screen. There, `←` and `→` go through the images, also to other pages, `Enter` prints it with the marked images, `Tab` marks it, and any other key goes back. |
 | `Tab` | Mark or unmark the selected image. |
 | `Enter` | Print the marked images in mark order, or else the selected image, and quit. |
+| `/`, `*`, `Backspace` | Rank by a text, rank like the selected image, or go back. The first page shows again. See [search inside](#search-inside). |
 | `→`, `Space`, `PageDown` | Show the next page. |
 | `←`, `PageUp` | Show the previous page. |
 | `Esc`, `Ctrl-C` | Quit and print nothing. |

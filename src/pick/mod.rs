@@ -1,16 +1,20 @@
+mod bind;
 mod grid;
 mod kitty;
 mod prefetch;
+mod rank;
 mod scatter;
 
 use std::{
     cell::RefCell,
+    fmt,
     io::{self, Write},
     mem,
     ops::ControlFlow::{self, Break, Continue},
     os::fd::OwnedFd,
     panic,
     path::{Path, PathBuf},
+    process::Child,
     sync::{atomic::Ordering::Relaxed, mpsc::TryRecvError},
     task::Poll,
     thread,
@@ -45,9 +49,11 @@ use rustix::{
     stdio::{dup2_stdin, dup2_stdout},
 };
 
+pub use self::bind::Bind;
 use self::{
     grid::Grid,
     prefetch::{Prefetch, Shape, Thumb, Ticket},
+    rank::Ranking,
     scatter::Scatter,
 };
 use crate::{
@@ -109,7 +115,7 @@ const HALF_BLOCK_EDGE: border::Set = border::Set {
 const HINTS: &str = "asdfghjklqwertyuiopzxcvbnm";
 const FRAME: Duration = Duration::from_millis(33);
 
-pub fn run(search: Search, view: View) -> Result<Exit> {
+pub fn run(search: Search, view: View, binds: Vec<Bind>) -> Result<Exit> {
     let name = match view {
         View::Scatter => "scatter",
         View::Grid => "grid",
@@ -121,8 +127,8 @@ pub fn run(search: Search, view: View) -> Result<Exit> {
     let picker = output::picker().unwrap_or_else(|_| Picker::halfblocks());
     let core = Core::new(search, picker)?;
     match view {
-        View::Scatter => App::new(Scatter::new(&core.search.order), core).run(&mut terminal),
-        View::Grid => App::new(Grid::default(), core).run(&mut terminal),
+        View::Scatter => App::new(Scatter::new(&core.search.order), core, binds).run(&mut terminal),
+        View::Grid => App::new(Grid::default(), core, binds).run(&mut terminal),
     }
 }
 
@@ -390,7 +396,13 @@ impl Core {
 /// What scatter and grid mode do in their own way: where the images go and which one is next.
 /// `App` handles the keys that they share.
 trait Board {
-    /// Takes the new hits and thumbnails, and moves on by `elapsed`.
+    /// Takes a hit, after the ones before it.
+    fn push(&mut self, hit: Hit);
+
+    /// Drops all hits, before the hits come again in a new order. `order` tells how they come.
+    fn clear(&mut self, order: &Order<()>);
+
+    /// Takes the new thumbnails, and moves on by `elapsed`.
     fn tick(&mut self, core: &mut Core, elapsed: Duration) -> Result<Outcome>;
 
     /// True when only a key or a resize can change the board.
@@ -423,14 +435,33 @@ trait Board {
     fn keys(&self) -> Span<'static>;
 }
 
+/// A bound command that runs in the background.
+struct Running {
+    name: String,
+    images: usize,
+    child: Child,
+}
+
 struct App<B> {
     core: Core,
     board: B,
+    ranking: Ranking,
+    binds: Vec<Bind>,
+    running: Vec<Running>,
+    /// A message for the status line, until the next key.
+    note: Option<Span<'static>>,
 }
 
 impl<B: Board> App<B> {
-    fn new(board: B, core: Core) -> Self {
-        Self { core, board }
+    fn new(board: B, core: Core, binds: Vec<Bind>) -> Self {
+        Self {
+            core,
+            board,
+            ranking: Ranking::new(),
+            binds,
+            running: Vec::new(),
+            note: None,
+        }
     }
 
     fn run(mut self, terminal: &mut DefaultTerminal) -> Result<Exit> {
@@ -439,6 +470,9 @@ impl<B: Board> App<B> {
             let area = terminal.size()?;
             let now = Instant::now();
             self.core.bounds = Rect::new(0, 0, area.width, area.height.saturating_sub(1));
+            self.drain()?;
+            self.rank();
+            self.reap();
             if let Break(exit) = self.board.tick(&mut self.core, now - last)? {
                 return Ok(exit);
             }
@@ -460,11 +494,74 @@ impl<B: Board> App<B> {
         !self.core.searching
             && !(self.core.zoom.as_ref()).is_some_and(|zoom| zoom.image.pending())
             && self.board.idle()
+            && self.ranking.idle()
+            && self.running.is_empty()
+    }
+
+    /// Gives each new hit to the ranking and the board.
+    fn drain(&mut self) -> Result<()> {
+        let Self {
+            core,
+            board,
+            ranking,
+            ..
+        } = self;
+        core.drain(|hit| {
+            ranking.add(&hit);
+            board.push(hit);
+        })
+    }
+
+    /// Shows the hits in the order of a new ranking.
+    fn rank(&mut self) {
+        match self.ranking.poll() {
+            Ok(Some(hits)) => {
+                let order = if self.ranking.probing() {
+                    &Order::Score(())
+                } else {
+                    &self.core.search.order
+                };
+                self.board.clear(order);
+                hits.into_iter().for_each(|hit| self.board.push(hit));
+            }
+            Ok(None) => {}
+            Err(e) => self.fail(&e),
+        }
+    }
+
+    fn fail(&mut self, e: &dyn fmt::Display) {
+        self.note = Some(format!("{}  ", output::clean(&format!("{e:#}"))).red());
+    }
+
+    /// Notes the bound commands that have ended.
+    fn reap(&mut self) {
+        let note = &mut self.note;
+        self.running.retain_mut(|run| {
+            let (ended, ok) = match run.child.try_wait() {
+                Ok(None) => return true,
+                Ok(Some(status)) if status.success() => ("done".to_owned(), true),
+                Ok(Some(status)) => (format!("failed, {status}"), false),
+                Err(e) => (format!("failed: {e}"), false),
+            };
+            let images = if run.images == 1 { "image" } else { "images" };
+            let text = format!("{} on {} {images}: {ended}  ", run.name, run.images);
+            *note = Some(if ok { text.green() } else { text.red() });
+            false
+        });
     }
 
     fn key(&mut self, key: KeyEvent) -> Outcome {
+        self.note = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Break(Exit::Aborted);
+        }
+        if self.ranking.typing() {
+            self.ranking.key(key);
+            return Continue(());
+        }
+        if let Some(bind) = self.binds.iter().find(|b| b.matches(key)) {
+            self.run_bind(bind.clone());
+            return Continue(());
         }
         if key
             .modifiers
@@ -495,9 +592,50 @@ impl<B: Board> App<B> {
                     self.zoom();
                 }
             }
+            KeyCode::Char('/') => {
+                if let Err(e) = self.ranking.open(&self.core.search) {
+                    self.fail(&e);
+                }
+            }
+            KeyCode::Char('*') => {
+                if let Some(path) = self.board.selected()
+                    && let Err(e) = self.ranking.like(path, &self.core.search)
+                {
+                    self.fail(&e);
+                }
+            }
+            KeyCode::Backspace => self.ranking.back(),
             code => self.board.key(&mut self.core, code),
         }
         Continue(())
+    }
+
+    /// Runs a bound command on the marked images, or else on the image in view.
+    fn run_bind(&mut self, bind: Bind) {
+        let paths = if self.core.marks.is_empty() {
+            self.shown().map(Path::to_path_buf).into_iter().collect()
+        } else {
+            self.core.marks.clone()
+        };
+        if paths.is_empty() {
+            return;
+        }
+        match bind.spawn(&paths) {
+            Ok(child) => self.running.push(Running {
+                name: bind.name,
+                images: paths.len(),
+                child,
+            }),
+            Err(e) => self.fail(&format!("{}: cannot run sh: {e}", bind.name)),
+        }
+    }
+
+    /// The image full screen, or else the selected image.
+    fn shown(&self) -> Option<&Path> {
+        match &self.core.zoom {
+            Some(zoom) => Some(&zoom.path),
+            None => self.board.selected(),
+        }
     }
 
     fn zoom_key(&mut self, code: KeyCode, zoom: Zoom) -> Outcome {
@@ -569,19 +707,21 @@ impl<B: Board> App<B> {
 
     fn status(&self) -> Line<'static> {
         let mut spans = vec![Span::raw(format!(" {}  ", self.core.search.status()))];
+        spans.extend(self.ranking.status());
         spans.extend(self.board.status());
         if !self.core.marks.is_empty() {
             spans.push(format!("{} marked  ", self.core.marks.len()).green());
         }
-        let shown = match &self.core.zoom {
-            Some(zoom) => Some(zoom.path.as_path()),
-            None => self.board.selected(),
-        };
-        if let Some(name) = shown.and_then(Path::file_name) {
+        if !self.running.is_empty() {
+            spans.push(format!("{} running  ", self.running.len()).dim());
+        }
+        spans.extend(self.note.clone());
+        if let Some(name) = self.shown().and_then(Path::file_name) {
             let name = output::clean_path(Path::new(name));
             spans.push(format!("{name}  ").yellow().bold());
         }
         spans.push(match self.core.zoom {
+            _ if self.ranking.typing() => "type to rank · enter keep · esc back".yellow(),
             Some(_) => "ZOOM  ←/→ step · tab mark · enter pick · any key back".yellow(),
             None => self.board.keys(),
         });
