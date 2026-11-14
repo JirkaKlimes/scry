@@ -128,37 +128,39 @@ impl Search {
         let (done, rx) = mpsc::channel();
         let (cache, progress) = (self.cache.clone(), self.progress.clone());
         thread::spawn(move || {
-            rten::thread_pool().run(move || {
-                // False once nobody waits for the answers.
-                let answer = |i, embedding: Result<Vec<f32>>| {
-                    if embedding.is_err() {
-                        progress.errors.fetch_add(1, Relaxed);
-                    }
-                    done.send(Ok((i, embedding.ok().map(Arc::from)))).is_ok()
-                };
-                for chunk in ready_chunks(&paths, CHUNK) {
-                    let mut keys = Vec::new();
-                    for (i, path) in chunk {
-                        match fs::metadata(&path) {
-                            Ok(md) => keys.push((i, Key::new(&path, &md))),
-                            Err(e) => _ = answer(i, Err(e.into())),
-                        }
-                    }
-                    let readable: Vec<&Key> = keys.iter().map(|(_, key)| key).collect();
-                    let embedded = match embeddings(&embedder, &cache, &readable) {
-                        Ok(embedded) => embedded,
-                        Err(e) => {
-                            let _ = done.send(Err(e));
-                            return;
-                        }
-                    };
-                    for ((i, _), embedding) in keys.iter().zip(embedded) {
-                        if !answer(*i, embedding) {
-                            return;
-                        }
+            // False once nobody waits for the answers.
+            let answer = |i, embedding: Result<Vec<f32>>| {
+                if embedding.is_err() {
+                    progress.errors.fetch_add(1, Relaxed);
+                }
+                done.send(Ok((i, embedding.ok().map(Arc::from)))).is_ok()
+            };
+            for chunk in ready_chunks(&paths, CHUNK) {
+                let mut keys = Vec::new();
+                for (i, path) in chunk {
+                    match fs::metadata(&path) {
+                        Ok(md) => keys.push((i, Key::new(&path, &md))),
+                        Err(e) => _ = answer(i, Err(e.into())),
                     }
                 }
-            });
+                let readable: Vec<&Key> = keys.iter().map(|(_, key)| key).collect();
+                // Only the work runs on rten's pool, not the wait for paths. A worker that waits
+                // in a join runs other jobs, and a job that waits for the picker would stall the
+                // search on that worker.
+                let embedded = rten::thread_pool().run(|| embeddings(&embedder, &cache, &readable));
+                let embedded = match embedded {
+                    Ok(embedded) => embedded,
+                    Err(e) => {
+                        let _ = done.send(Err(e));
+                        return;
+                    }
+                };
+                for ((i, _), embedding) in keys.iter().zip(embedded) {
+                    if !answer(*i, embedding) {
+                        return;
+                    }
+                }
+            }
         });
         (tx, rx)
     }
@@ -202,7 +204,7 @@ pub fn run(query: Query) -> Result<Search> {
     // The walk starts first, so it runs while the models load.
     let walk = walk::candidates(query.source, query.walk)?;
     let paths = counted(walk.found, progress.clone());
-    let cache = Arc::new(Cache::open());
+    let cache = Arc::new(Cache::open()?);
     let (order, sort) = match query.order {
         Order::Found => (Order::Found, Order::Found),
         Order::Score(scoring) => (

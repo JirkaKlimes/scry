@@ -168,7 +168,7 @@ pub fn notes(progress: &Progress, skipped: Option<Skipped>) {
     if errors > 0 {
         notes += &format!("scry: skipped {errors} unreadable {}\n", files(errors));
     }
-    if let Some(e) = embed::gpu_failure() {
+    if let Some(e) = embed::gpu::failure() {
         notes += &format!("scry: used the CPU, because the GPU failed: {e}\n");
         notes += "tip: set SCRY_DEVICE=cpu to skip the GPU.\n";
     }
@@ -243,6 +243,13 @@ fn xterm(color: Color) -> Color {
     Color::Indexed(16 + 36 * level(r) + 6 * level(g) + level(b))
 }
 
+/// Where `tty` looks, for messages.
+pub const TERMINAL: &str = if cfg!(target_os = "macos") {
+    "a terminal on stdin, stdout or stderr"
+} else {
+    "a terminal"
+};
+
 /// The controlling terminal. A copy of a stdio fd comes first, because macOS cannot poll an open
 /// /dev/tty. A copy also needs no access to the device file, which after `su` belongs to another
 /// user.
@@ -252,9 +259,7 @@ pub fn tty() -> io::Result<OwnedFd> {
         return fd.try_clone_to_owned();
     }
     if cfg!(target_os = "macos") {
-        return Err(io::Error::other(
-            "on macOS, stdin, stdout or stderr must be the terminal",
-        ));
+        return Err(io::Error::other(format!("found no {TERMINAL}")));
     }
     let tty = File::options().read(true).write(true).open("/dev/tty")?;
     Ok(tty.into())

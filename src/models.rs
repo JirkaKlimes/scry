@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use indicatif::{DecimalBytes, ProgressBar, ProgressStyle};
 use rten::Model;
 use sha2::{Digest, Sha256};
 
@@ -108,14 +108,15 @@ fn agent() -> ureq::Agent {
 /// the run is slow.
 fn progress(asset: &Asset, size: Option<u64>, dir: &Path) -> Result<ProgressBar> {
     let size_text = size
-        .map(|n| format!(" ({})", HumanBytes(n)))
+        .map(|n| format!(" ({})", DecimalBytes(n)))
         .unwrap_or_default();
     eprintln!(
-        "scry: downloading the {}{size_text} to {}. scry does this only once.",
+        "scry: downloading the {}{size_text} to {}. Later runs use this copy.",
         asset.label,
         clean_path(dir)
     );
-    let style = ProgressStyle::with_template("{msg} {bar:30} {bytes}/{total_bytes} {eta}")?;
+    let style =
+        ProgressStyle::with_template("{msg} {bar:30} {decimal_bytes}/{decimal_total_bytes} {eta}")?;
     Ok(ProgressBar::new(size.unwrap_or(0))
         .with_style(style)
         .with_message(asset.label))

@@ -6,9 +6,11 @@ use std::{
     sync::{Condvar, Mutex},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use exif::{In, Tag};
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, metadata::Orientation};
+use image::{
+    DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, metadata::Orientation,
+};
 use rustix::fs::{Mode, OFlags};
 
 use crate::guard;
@@ -131,10 +133,12 @@ pub fn load(path: &Path, side: u32) -> Result<DynamicImage> {
                 let orientation = header.orientation;
                 // The EXIF of a TIFF holds a copy of the file.
                 drop(header);
-                let decoder =
-                    ImageReader::with_format(BufReader::new(file), format).into_decoder()?;
+                let decoder = ImageReader::with_format(BufReader::new(file), format)
+                    .into_decoder()
+                    .map_err(flat)?;
                 // Turn the small copy: a square fit gives the same result before and after a turn.
-                let mut image = shrink(DynamicImage::from_decoder(decoder)?, side);
+                let image = DynamicImage::from_decoder(decoder).map_err(flat)?;
+                let mut image = shrink(image, side);
                 image.apply_orientation(orientation);
                 image
             }
@@ -148,6 +152,17 @@ pub fn load(path: &Path, side: u32) -> Result<DynamicImage> {
         drop(charge);
         Ok(image)
     })
+}
+
+/// An image error repeats its source in its message, and some decoders end it with a newline.
+fn flat(e: ImageError) -> anyhow::Error {
+    anyhow!(
+        "{}",
+        e.to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 fn shrink(image: DynamicImage, side: u32) -> DynamicImage {
@@ -180,8 +195,10 @@ fn parse(bytes: &[u8], path: &Path, whole: bool) -> Result<Header> {
     if !format.as_ref().is_ok_and(ImageFormat::reading_enabled) {
         return parse_imageio(bytes, whole);
     }
-    let format = format?;
-    let mut decoder = ImageReader::with_format(Cursor::new(bytes), format).into_decoder()?;
+    let format = format.map_err(flat)?;
+    let mut decoder = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_decoder()
+        .map_err(flat)?;
     let (width, height) = decoder.dimensions();
     let exif = match read_exif(&mut decoder, format, bytes) {
         Ok(exif) => exif,
@@ -235,7 +252,7 @@ fn read_exif(
 ) -> Result<Option<exif::Exif>> {
     let raw = match format {
         ImageFormat::Tiff => Some(bytes.to_vec()),
-        _ => decoder.exif_metadata()?,
+        _ => decoder.exif_metadata().map_err(flat)?,
     };
     Ok(raw
         .map(|raw| exif::Reader::new().read_raw(raw))

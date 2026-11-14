@@ -5,7 +5,13 @@ name: GPU
 on:
   push:
     branches: [main]
-    paths: &gpu [Cargo.lock, src/embed.rs, src/embed/**, .github/workflows/gpu.yml]
+    paths: &gpu
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - src/embed.rs
+      - src/embed/**
+      - .github/workflows/gpu.yml
   pull_request:
     paths: *gpu
   workflow_dispatch:
@@ -17,6 +23,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SCRY_CACHE: ${{ github.workspace }}/.scry
+
 jobs:
   # The runner has no GPU. lavapipe is a Vulkan driver that runs on the CPU.
   vulkan:
@@ -24,6 +33,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - &models
+        uses: actions/cache@v6
+        with:
+          path: .scry/models
+          key: models-${{ hashFiles('src/embed.rs') }}
+          restore-keys: models-
       - run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
       - run: cargo test --locked gpu_matches_cpu -- --ignored
 
@@ -35,4 +50,5 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - *models
       - run: cargo test --locked gpu_matches_cpu -- --ignored

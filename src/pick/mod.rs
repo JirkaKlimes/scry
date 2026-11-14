@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 use image::Rgba;
 use indicatif::ProgressBar;
 use ratatui::{
@@ -120,7 +120,8 @@ pub fn run(search: Search, view: View, binds: Vec<Bind>) -> Result<Exit> {
         View::Scatter => "scatter",
         View::Grid => "grid",
     };
-    let _stdio = TtyStdio::swap().with_context(|| format!("{name} mode needs a terminal"))?;
+    // The cause adds nothing: on Linux it is ENXIO from /dev/tty.
+    let _stdio = TtyStdio::swap().map_err(|_| anyhow!("{name} mode needs {}", output::TERMINAL))?;
     restore_on_panic();
     let _restore = Restore;
     let mut terminal = init()?;

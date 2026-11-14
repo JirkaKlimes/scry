@@ -23,7 +23,7 @@ use crate::{
 /// move all the time.
 const REFRESH: Duration = Duration::from_millis(500);
 
-const NO_MODEL: &str = "this needs the SigLIP 2 model: run scry -q once to download it";
+const NO_MODEL: &str = "this needs the SigLIP 2 model: run a scry -q search once to download it";
 
 /// What the hits are ranked by.
 #[derive(Clone, PartialEq)]
