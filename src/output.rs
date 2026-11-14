@@ -43,7 +43,7 @@ use rustix::{
 };
 
 use crate::{
-    decode,
+    decode, embed,
     search::{Hit, Progress, Search},
     walk::Skipped,
 };
@@ -167,6 +167,10 @@ pub fn notes(progress: &Progress, skipped: Option<Skipped>) {
     }
     if errors > 0 {
         notes += &format!("scry: skipped {errors} unreadable {}\n", files(errors));
+    }
+    if let Some(e) = embed::gpu_failure() {
+        notes += &format!("scry: used the CPU, because the GPU failed: {e}\n");
+        notes += "tip: set SCRY_DEVICE=cpu to skip the GPU.\n";
     }
     if found + unsupported == 0 {
         notes += "scry: found no image files\n";

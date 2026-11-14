@@ -13,10 +13,15 @@ use tokenizers::{
     TruncationParams, models::bpe::BPE,
 };
 
+use self::gpu::{Device, Vision};
 use crate::{
     guard,
     models::{self, Asset},
 };
+
+mod gpu;
+
+pub use self::gpu::failure as gpu_failure;
 
 macro_rules! hf {
     ($file:literal) => {
@@ -62,6 +67,8 @@ const BIAS: f32 = -16.771_725;
 const SIZE: usize = 224;
 const TOKENS: usize = 64;
 const BATCH: usize = 8;
+/// A GPU takes 0.5 to 2.5 s to start, about the time that the CPU needs for 5 to 20 images.
+const GPU_MIN: usize = 2 * BATCH;
 
 // With the generic `Tokenizer`, serde buffers the 256k vocab through untagged enums, which
 // makes loading about twice as slow.
@@ -76,7 +83,10 @@ type Tokenizer = TokenizerImpl<
 /// The image tower. It loads on first use: a search with cached embeddings does not need it.
 pub struct ImageEmbedder {
     path: PathBuf,
-    tower: OnceLock<Tower>,
+    device: Device,
+    cpu: OnceLock<Tower>,
+    /// None if the CPU runs the tower.
+    gpu: OnceLock<Option<Vision>>,
 }
 
 impl ImageEmbedder {
@@ -86,23 +96,44 @@ impl ImageEmbedder {
     }
 
     pub fn load() -> Result<Self> {
-        // Download now, so a progress bar never cuts into the scatter UI later.
         Ok(Self {
+            device: Device::from_env()?,
+            // Download now, so a progress bar never cuts into a picker later.
             path: models::fetch(&VISION)?,
-            tower: OnceLock::new(),
+            cpu: OnceLock::new(),
+            gpu: OnceLock::new(),
         })
     }
 
     pub fn images(&self, images: &[&DynamicImage]) -> Result<Vec<Vec<f32>>> {
         guard(|| {
+            let gpu = self.gpu(images.len())?;
             let mut out = Vec::with_capacity(images.len());
             for batch in images.chunks(BATCH) {
-                let tower = get_or_load(&self.tower, || Tower::load(&self.path, "pixel_values"))?;
                 let pixels = batch.par_iter().flat_map_iter(|i| pixels(i)).collect();
-                out.extend(tower.run(Value::from_shape([batch.len(), 3, SIZE, SIZE], pixels)?)?);
+                out.extend(match gpu {
+                    Some(gpu) => gpu.run(pixels)?,
+                    None => self
+                        .cpu()?
+                        .run(Value::from_shape([batch.len(), 3, SIZE, SIZE], pixels)?)?,
+                });
             }
             Ok(out)
         })
+    }
+
+    /// Under auto, the CPU embeds a few images sooner than a GPU can start. Once a GPU runs, it
+    /// takes all images.
+    fn gpu(&self, images: usize) -> Result<Option<&Vision>> {
+        if self.device == Device::Auto && images < GPU_MIN && self.gpu.get().is_none() {
+            return Ok(None);
+        }
+        let open = || Vision::open(&self.path, self.device, self.cpu()?);
+        Ok(get_or_load(&self.gpu, open)?.as_ref())
+    }
+
+    fn cpu(&self) -> Result<&Tower> {
+        get_or_load(&self.cpu, || Tower::load(&self.path, "pixel_values"))
     }
 }
 

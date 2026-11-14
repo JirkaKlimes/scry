@@ -1,0 +1,38 @@
+name: GPU
+
+# Checks that the GPU gives the embeddings of the CPU. It runs only when the GPU code or a
+# dependency changes, because the macOS runner is expensive.
+on:
+  push:
+    branches: [main]
+    paths: &gpu [Cargo.lock, src/embed.rs, src/embed/**, .github/workflows/gpu.yml]
+  pull_request:
+    paths: *gpu
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The runner has no GPU. lavapipe is a Vulkan driver that runs on the CPU.
+  vulkan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
+      - run: cargo test --locked gpu_matches_cpu -- --ignored
+
+  # Apple silicon, with Metal. Waits for the Vulkan job, so a broken change costs no macOS minutes.
+  metal:
+    needs: vulkan
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - run: cargo test --locked gpu_matches_cpu -- --ignored
