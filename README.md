@@ -30,7 +30,7 @@ nix run github:JirkaKlimes/scry -- -q "a red bicycle" ~/Pictures
 
 The prebuilt Linux binaries need glibc 2.35 or newer (Ubuntu 22.04, Debian 12). On other systems, use `cargo install`. The crate is `scry-cli`, because `scry` is taken on crates.io.
 
-The first `-q` search downloads the SigLIP 2 model (about 500 MB), and `-l` needs only its image part (about 190 MB). The first `-t` or `-o` search downloads the OCR models (about 12 MB). scry checks each model against a pinned SHA-256 hash and keeps it in `~/.cache/scry`, `~/Library/Caches/scry` on macOS, or `$SCRY_CACHE`.
+The first `-q` search downloads the SigLIP 2 model (about 500 MB), and `-l` needs only its image part (about 190 MB). The first `-t` or `-o` search downloads the OCR models (about 12 MB). scry checks each model against a pinned SHA-256 hash and keeps it in the cache directory: `$SCRY_CACHE`, else `$XDG_CACHE_HOME/scry` or `~/.cache/scry` on Linux, and `~/Library/Caches/scry` on macOS.
 
 ## Examples
 
@@ -74,20 +74,23 @@ Scatter mode (`-s`) shows the images one at a time, each at a new place on the s
 | `a` to `z` | Select the image with that hint letter. In scatter mode, pause first. |
 | `A` to `Z` | Show that image full screen. `←` and `→` go through the images. |
 | `Tab` | Mark or unmark the selected image. |
-| `Enter` | Print the marked images, or else the selected image, and quit. |
+| `Enter` | Print the marked images, or else the selected image, and quit. In scatter mode with neither, pause and select the best image in view. |
 | `/` | Rank the images by a text as you type it. `Enter` keeps the ranking, `Esc` goes back. |
 | `*` | Rank the images by how similar they look to the selected image. |
 | `Backspace` | Go back one ranking. |
 | `Esc`, `Ctrl-C` | Quit and print nothing. |
-| Scatter mode | `Space` pauses, `←` and `→` step through the images, `+` and `-` change the speed, `]` and `[` the size. |
+| Scatter mode | `Space` pauses and plays, `←` and `→` step through the images, `+` and `-` change the speed, `]` and `[` the size. |
 | Grid mode | `←`, `→`, `Space`, `PageUp` and `PageDown` change the page. |
 
 A ranking changes only the order: options like `-t`, `--date` and `--min` still choose the images. Marks stay, so you can mark images from many queries and print them all at once. Without `-q` or `-l`, the first `/` or `*` embeds the images in the background.
 
-`--bind KEY:COMMAND` runs a command on the marked images, or else on the selected image. KEY is `ctrl-a` to `ctrl-z`, `alt-a` to `alt-z`, or `f1` to `f12`. The paths go to `sh` as arguments (`"$1"`, `"$@"`), so no file name can inject code. The command runs in the background, and the status line tells you when it ends.
+`--bind KEY:COMMAND` runs a command on the marked images, or else on the selected image. KEY is `ctrl-a` to `ctrl-z` (except `ctrl-c`, `ctrl-h`, `ctrl-i`, `ctrl-j` and `ctrl-m`), `alt-a` to `alt-z`, or `f1` to `f12`. The paths go to `sh` as arguments (`"$1"`, `"$@"`), so no file name can inject code. The command runs in the background, and the status line tells you when it ends.
 
 ```sh
+# Copy the images to a folder, or move them to the trash (gio is a Linux tool)
 scry --grid --bind 'ctrl-d:cp -- "$@" ~/picked/' --bind 'ctrl-x:gio trash -- "$@"' ~/Pictures
+
+# Copy the selected image, to paste it in a chat (wl-copy is for Linux with Wayland)
 scry --grid -q "a diagram" --bind 'ctrl-y:wl-copy < "$1"' ~/Documents
 ```
 
@@ -97,7 +100,7 @@ kitty, Ghostty, iTerm2, WezTerm, foot and other terminals with sixel support sho
 
 scry runs the fast filters first, and the slow ones only on the images that are left: paths, then the image header and EXIF, then [SigLIP 2](https://huggingface.co/google/siglip2-base-patch16-224) embeddings, then OCR. It compares the query with each image directly, with no vector database, so the result is exact and works with all filters. The cache keeps the embeddings, text and metadata of each file until the file changes.
 
-The first search over a folder is slow: an 8-core laptop CPU (Ryzen 9 8945HS) embeds or reads the text of about 8 to 10 images per second. Later searches process only new or changed images, and take well under a second.
+The first search over a folder is slow: an 8-core laptop CPU (Ryzen 9 8945HS) embeds or reads the text of about 8 to 10 images per second. Later searches process only new or changed images, and take well under a second. A new `-q` text adds about a second, to load the text model.
 
 To embed 16 or more new images, scry uses a discrete GPU or the GPU of Apple silicon: Vulkan on Linux, Metal on macOS. On a laptop with an RTX 3070, this halves the time of a first `-q` search. Integrated GPUs on Linux and Intel Macs are often slower than the CPU, so scry uses them only with `SCRY_DEVICE=gpu`. `SCRY_DEVICE=cpu` turns the GPU off. Before scry uses a GPU, it checks that the GPU gives the same embeddings as the CPU.
 
@@ -123,7 +126,7 @@ Delete `cache.redb` in the cache directory. For a computer without internet, cop
 
 ## Credits
 
-SigLIP 2 is by Google, under Apache 2.0, and the ONNX export is from [onnx-community](https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX). The OCR models and the CPU runtime are Robert Knight's [ocrs](https://github.com/robertknight/ocrs) and [rten](https://github.com/robertknight/rten). The GPU runs on Sonos's [tract](https://github.com/sonos/tract) and [wgpu](https://github.com/gfx-rs/wgpu). [ratatui-image](https://github.com/benjajaja/ratatui-image) draws the images in the terminal. The photos in the demo are from [Unsplash](https://unsplash.com), through [Lorem Picsum](https://picsum.photos).
+SigLIP 2 is by Google, under Apache 2.0, and the ONNX export is from [onnx-community](https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX). The OCR models and the CPU runtime are Robert Knight's [ocrs](https://github.com/robertknight/ocrs) and [rten](https://github.com/robertknight/rten). The GPU runs on [tract](https://github.com/sonos/tract) by Sonos and on [wgpu](https://github.com/gfx-rs/wgpu). [ratatui-image](https://github.com/benjajaja/ratatui-image) draws the images in the terminal. The photos in the demo are from [Unsplash](https://unsplash.com), through [Lorem Picsum](https://picsum.photos).
 
 If scry saves you time, you can [buy me a coffee](https://buymeacoffee.com/jiriklimes).
 
