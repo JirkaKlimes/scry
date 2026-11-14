@@ -27,11 +27,7 @@ impl FromStr for Bind {
         if command.trim().is_empty() {
             return Err(format!("{name} has no command"));
         }
-        let (modifiers, code) = key(&name.to_ascii_lowercase()).ok_or(format!(
-            "unknown key '{name}': use ctrl-a to ctrl-z, alt-a to alt-z, or f1 to f12. \
-             Letters alone pick images, ctrl-c quits, and terminals send ctrl-h, ctrl-i, \
-             ctrl-j and ctrl-m as other keys"
-        ))?;
+        let (modifiers, code) = key(&name.to_ascii_lowercase())?;
         Ok(Self {
             name: name.to_owned(),
             modifiers,
@@ -41,21 +37,34 @@ impl FromStr for Bind {
     }
 }
 
-fn key(name: &str) -> Option<(KeyModifiers, KeyCode)> {
+fn key(name: &str) -> Result<(KeyModifiers, KeyCode), String> {
     let letter = |s: &str| match s.as_bytes() {
         [c @ b'a'..=b'z'] => Some(char::from(*c)),
         _ => None,
     };
+    let unknown =
+        || format!("unknown key '{name}': use ctrl-a to ctrl-z, alt-a to alt-z, or f1 to f12");
+    if let Some(c) = letter(name) {
+        return Err(format!(
+            "'{c}' alone selects an image: use ctrl-{c}, alt-{c}, or f1 to f12"
+        ));
+    }
     if let Some(rest) = name.strip_prefix("ctrl-") {
-        let c = letter(rest).filter(|c| !"chijm".contains(*c))?;
-        Some((KeyModifiers::CONTROL, KeyCode::Char(c)))
+        match letter(rest).ok_or_else(unknown)? {
+            'c' => Err("ctrl-c quits scry".into()),
+            'h' | 'i' | 'j' | 'm' => Err("terminals send ctrl-h, ctrl-i, ctrl-j and ctrl-m as \
+                 Backspace, Tab and Enter"
+                .into()),
+            c => Ok((KeyModifiers::CONTROL, KeyCode::Char(c))),
+        }
     } else if let Some(rest) = name.strip_prefix("alt-") {
-        Some((KeyModifiers::ALT, KeyCode::Char(letter(rest)?)))
+        let c = letter(rest).ok_or_else(unknown)?;
+        Ok((KeyModifiers::ALT, KeyCode::Char(c)))
     } else {
-        let n = name.strip_prefix('f')?.parse().ok()?;
-        (1..=12)
-            .contains(&n)
-            .then_some((KeyModifiers::NONE, KeyCode::F(n)))
+        match name.strip_prefix('f').and_then(|n| n.parse().ok()) {
+            Some(n @ 1..=12) => Ok((KeyModifiers::NONE, KeyCode::F(n))),
+            _ => Err(unknown()),
+        }
     }
 }
 
@@ -105,6 +114,12 @@ mod tests {
             assert!(bind(bad).is_err(), "{bad}");
         }
         assert_eq!(bind("f12:a:b").unwrap().command, "a:b");
+        assert_eq!(bind("ctrl-c:x").unwrap_err(), "ctrl-c quits scry");
+        assert!(
+            bind("D:x")
+                .unwrap_err()
+                .starts_with("'d' alone selects an image")
+        );
     }
 
     #[test]

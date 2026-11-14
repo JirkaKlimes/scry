@@ -119,16 +119,17 @@ pub struct View<'a> {
 
 impl Cache {
     /// Without a cache the search is slower, and scatter mode cannot spread out look-alikes.
-    /// Neither is an error.
-    pub fn open() -> Self {
-        let db = dir().and_then(|dir| {
+    /// Neither is an error, but a bad SCRY_CACHE is.
+    pub fn open() -> Result<Self> {
+        let dir = location(env::var_os("SCRY_CACHE"))?;
+        let db = create(&dir).and_then(|()| {
             let path = dir.join("cache.redb");
             open_or_replace(&path).with_context(|| clean_path(&path).to_string())
         });
         let db = db
             .inspect_err(|e| eprintln!("scry: running without a cache: {e:#}"))
             .ok();
-        Self::new(db)
+        Ok(Self::new(db))
     }
 
     fn new(db: Option<Database>) -> Self {
@@ -314,17 +315,27 @@ fn from_f16(bits: Embedding) -> Vec<f32> {
         .collect()
 }
 
-/// The cache directory. Only its owner can open it: the cache holds file paths and the text in
-/// images.
 pub fn dir() -> Result<PathBuf> {
     let dir = location(env::var_os("SCRY_CACHE"))?;
+    create(&dir)?;
+    Ok(dir)
+}
+
+/// Only its owner can open the directory: the cache holds file paths and the text in images.
+fn create(dir: &Path) -> Result<()> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&dir)
-        .with_context(|| clean_path(&dir).to_string())?;
-    Ok(dir)
+        .create(dir)
+        .with_context(|| clean_path(dir).to_string())
 }
+
+/// The cache directory of the system, for the help.
+pub const DEFAULT_DIR: &str = if cfg!(target_os = "macos") {
+    "~/Library/Caches/scry"
+} else {
+    "$XDG_CACHE_HOME/scry, or ~/.cache/scry"
+};
 
 /// SCRY_CACHE, else the cache directory of the system. An empty SCRY_CACHE counts as unset.
 /// A relative one would put models where scry runs, and trust a model file found there.

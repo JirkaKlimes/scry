@@ -69,12 +69,13 @@ pub fn pixel_range(s: &str) -> Result<Range<u32>, String> {
 }
 
 pub fn time_range(s: &str) -> Result<Range<DateTime>, String> {
+    let now = Zoned::now();
     if !s.contains("..") && s.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        time_period(s, &now)?;
         return Err(format!(
             "an age needs a side: {s}.. for newer, ..{s} for older"
         ));
     }
-    let now = Zoned::now();
     Range::parse(s, |p| time_period(p, &now))
 }
 

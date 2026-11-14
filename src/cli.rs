@@ -14,8 +14,8 @@ use regex_syntax::ast::{Ast, ClassSetItem, Visitor, parse::Parser as RegexParser
 use rustix::fs::FileType;
 
 use crate::{
-    decode,
-    embed::Prompt,
+    cache, decode,
+    embed::{self, Prompt},
     meta::{self, MetaFilter, Range},
     output::{self, End, ListOpts, clean_path},
     pick::{Bind, View},
@@ -42,22 +42,32 @@ const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
     max_term_width = 100,
     group(ArgGroup::new("rank").args(["query", "like"])),
     group(ArgGroup::new("view").args(["scatter", "grid"])),
-    after_help = "\
+    after_help = format!("\
 RANGE is A..B, A.., ..B or A. Both ends are inclusive. A date (2024, 2024-06, 2024-06-15) covers \
 the whole period. An age (12h, 7d, 2w, 3mo, 1y) counts back from now: --date 7d.. is the last 7 \
 days, ..1y is older than a year.
 
+Environment:
+  SCRY_CACHE   Directory for the models and the cache
+               [default: {cache}]
+  SCRY_DEVICE  Where the image model runs [default: auto]
+               auto: {gpu} ({api}), else the CPU
+               gpu: any GPU, also an integrated one. An error if there is none
+               cpu: only the CPU
+
+Exit status: 0 if scry printed a path, else 1. 2 on error, or if scry printed nothing and \
+skipped an unreadable file. 130 if you quit scatter or grid mode.
+
 Examples:
   scry -q 'a dog in the snow' ~/Pictures
-  scry -t 'INV-\\d{4}' ~/Documents
-  scry -s --date 2024-07 ~/Pictures
-  scry --order newest -n 1 -t error ~/Pictures/Screenshots
-
-scry keeps models and a cache in $XDG_CACHE_HOME/scry (usually ~/.cache/scry), or in \
-~/Library/Caches/scry on macOS. Set SCRY_CACHE to use another directory.
-scry runs the image model on a fast GPU if it finds one: Vulkan on Linux, Metal on macOS. Set \
-SCRY_DEVICE=cpu to use only the CPU, or SCRY_DEVICE=gpu to use any GPU, also a slow one.
-Exit status: 0 if scry printed a path, 1 if not, 2 on error, 130 if you quit scatter or grid mode."
+  scry -t 'INV-\\d{{4}}' ~/Documents
+  scry --grid --date 2024-07 ~/Pictures
+  scry --grid --bind 'ctrl-d:cp -- \"$@\" ~/picked/' ~/Pictures
+  scry --order newest -n 1 -t error ~/Pictures/Screenshots",
+        cache = cache::DEFAULT_DIR,
+        gpu = embed::gpu::AUTO,
+        api = embed::gpu::API,
+    )
 )]
 struct Args {
     /// Files or directories [default: paths on stdin if it is a pipe or a file, else .]
@@ -97,7 +107,7 @@ struct Args {
     #[arg(short, long, value_name = "REGEX", help_heading = "Text in images")]
     text: Vec<String>,
 
-    /// Ignore case in REGEX [default: only if it has no capital letter]
+    /// Ignore case in -t [default: only if the pattern has no capital letter]
     #[arg(short, long, requires = "text", help_heading = "Text in images")]
     ignore_case: bool,
 
@@ -150,13 +160,12 @@ struct Args {
     #[arg(short, long, help_heading = "Output")]
     scatter: bool,
 
-    /// Pick images by eye from pages of thumbnails. See grid mode.
+    /// Pick images by eye from pages of thumbnails
     #[arg(long, help_heading = "Output")]
     grid: bool,
 
-    /// In scatter or grid mode, run COMMAND on the marked or selected images when you press KEY
-    /// (ctrl-a to ctrl-z, alt-a to alt-z, f1 to f12). COMMAND gets the paths as "$@"
-    /// (repeatable)
+    /// In scatter or grid mode, run COMMAND when you press KEY (ctrl-a to ctrl-z, alt-a to alt-z,
+    /// f1 to f12). COMMAND gets the marked images, or else the selected one, as "$@" (repeatable)
     #[arg(
         long,
         value_name = "KEY:COMMAND",
@@ -165,11 +174,12 @@ struct Args {
     )]
     bind: Vec<Bind>,
 
-    /// Sort by date, newest or oldest first
+    /// Sort by the date that --date uses
     #[arg(long, value_name = "ORDER", help_heading = "Output")]
     order: Option<DateOrder>,
 
-    /// Print at most N paths, or all [default: 20 with -q or -l, unless --min, -s or --grid]
+    /// Print at most N paths (a number, or all) [default: 20 with -q or -l, unless --min, -s or
+    /// --grid]
     #[arg(short = 'n', long, value_name = "N", value_parser = limit, help_heading = "Output")]
     limit: Option<Limit>,
 
@@ -414,6 +424,7 @@ fn shows(s: &&str) -> bool {
 /// Checks the --like image now, not after the model download.
 fn check_like(path: &Path) -> Result<(), clap::Error> {
     let problem = match fs::metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => "no such file or directory".into(),
         Err(e) => e.to_string(),
         Ok(md) if md.is_dir() => "it is a directory".into(),
         Ok(md) if !md.is_file() => "it is not a regular file".into(),
@@ -546,7 +557,7 @@ mod tests {
     #[test]
     fn like_is_checked_before_the_search() {
         let message = |args: &[&str]| parse(args).err().unwrap().to_string();
-        assert!(message(&["-l", "typo.jpg"]).contains("for '--like <IMAGE>': No such file"));
+        assert!(message(&["-l", "typo.jpg"]).contains("for '--like <IMAGE>': no such file"));
         assert!(message(&["-l", "src"]).contains("it is a directory"));
         assert!(message(&["-l", "Cargo.toml"]).contains("not an image file"));
         assert_eq!(err(&["-l", "Cargo.toml"]), ErrorKind::ValueValidation);
@@ -734,5 +745,18 @@ mod tests {
     #[test]
     fn help_renders() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn help_names_only_this_platform() {
+        let help = Args::command().render_long_help().to_string();
+        let other = if cfg!(target_os = "macos") {
+            ["Linux", "Vulkan", "XDG"]
+        } else {
+            ["macOS", "Metal", "Library"]
+        };
+        for word in other {
+            assert!(!help.contains(word), "{word} in the help");
+        }
     }
 }

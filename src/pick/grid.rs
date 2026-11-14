@@ -284,7 +284,7 @@ impl Board for Grid {
     }
 
     fn keys(&self) -> Span<'static> {
-        "a-z select · A-Z zoom · tab mark · enter pick · ←/→ page · / search · * similar · esc quit"
+        "a-z select · A-Z zoom · tab mark · enter pick · ←/→ page · / rank · * similar · esc quit"
             .dim()
     }
 }

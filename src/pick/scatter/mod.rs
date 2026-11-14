@@ -453,11 +453,11 @@ impl Board for Scatter {
     fn keys(&self) -> Span<'static> {
         match self.state {
             State::Paused(_) => {
-                "PAUSED  ←/→ step · a-z select · A-Z zoom · tab mark · enter pick · * similar"
+                "PAUSED  space play · ←/→ step · a-z select · A-Z zoom · tab mark · enter pick · * similar"
                     .yellow()
             }
             State::Running => {
-                "space pause · ← back · enter pick · / search · +/- speed · [/] size · esc quit"
+                "space pause · ← back · enter best · / rank · +/- speed · [/] size · esc quit"
                     .dim()
             }
         }

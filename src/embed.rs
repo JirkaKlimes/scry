@@ -19,9 +19,7 @@ use crate::{
     models::{self, Asset},
 };
 
-mod gpu;
-
-pub use self::gpu::failure as gpu_failure;
+pub mod gpu;
 
 macro_rules! hf {
     ($file:literal) => {
@@ -106,6 +104,9 @@ impl ImageEmbedder {
     }
 
     pub fn images(&self, images: &[&DynamicImage]) -> Result<Vec<Vec<f32>>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
         guard(|| {
             let gpu = self.gpu(images.len())?;
             let mut out = Vec::with_capacity(images.len());
@@ -125,11 +126,28 @@ impl ImageEmbedder {
     /// Under auto, the CPU embeds a few images sooner than a GPU can start. Once a GPU runs, it
     /// takes all images.
     fn gpu(&self, images: usize) -> Result<Option<&Vision>> {
-        if self.device == Device::Auto && images < GPU_MIN && self.gpu.get().is_none() {
+        let wait = match self.device {
+            Device::Cpu => return Ok(None),
+            Device::Auto => images < GPU_MIN,
+            Device::Gpu => false,
+        };
+        if wait && self.gpu.get().is_none() {
             return Ok(None);
         }
-        let open = || Vision::open(&self.path, self.device, self.cpu()?);
-        Ok(get_or_load(&self.gpu, open)?.as_ref())
+        Ok(get_or_load(&self.gpu, || self.open_gpu())?.as_ref())
+    }
+
+    /// The GPU takes all images once it runs, so a CPU tower that only its check needs goes away.
+    fn open_gpu(&self) -> Result<Option<Vision>> {
+        if let Some(cpu) = self.cpu.get() {
+            return Vision::open(&self.path, self.device, cpu);
+        }
+        let cpu = Tower::load(&self.path, "pixel_values")?;
+        let gpu = Vision::open(&self.path, self.device, &cpu)?;
+        if gpu.is_none() {
+            let _ = self.cpu.set(cpu);
+        }
+        Ok(gpu)
     }
 
     fn cpu(&self) -> Result<&Tower> {

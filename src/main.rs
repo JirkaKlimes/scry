@@ -26,13 +26,15 @@ use cli::Mode;
 use pick::Exit;
 
 fn main() -> ExitCode {
-    match run() {
+    let code = match run() {
         Ok(code) => code,
         Err(e) => {
             eprintln!("scry: {e:#}");
             ExitCode::from(2)
         }
-    }
+    };
+    embed::gpu::stop();
+    code
 }
 
 fn run() -> Result<ExitCode> {
@@ -41,17 +43,20 @@ fn run() -> Result<ExitCode> {
     let search = search::run(query)?;
     let (progress, skipped) = (search.progress.clone(), search.skipped);
     let printed = match mode {
-        Mode::List(opts) => output::list(search, &opts)? > 0,
+        Mode::List(opts) => Some(output::list(search, &opts)? > 0),
         Mode::Pick { view, binds, end } => match pick::run(search, view, binds)? {
             Exit::Picked(paths) => {
                 output::paths(&paths, end)?;
-                true
+                Some(true)
             }
-            Exit::Empty => false,
-            Exit::Aborted => return Ok(ExitCode::from(130)),
+            Exit::Empty => Some(false),
+            Exit::Aborted => None,
         },
     };
     output::notes(&progress, skipped);
+    let Some(printed) = printed else {
+        return Ok(ExitCode::from(130));
+    };
     let failed = progress.errors.load(Relaxed) > 0;
     Ok(match (printed, failed) {
         (true, _) => ExitCode::SUCCESS,
