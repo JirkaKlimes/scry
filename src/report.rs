@@ -399,6 +399,7 @@ pub fn error(code: Fault, message: &str) {
     if json() {
         let _ = emit(&Event::Error { code, message });
     } else {
+        clear();
         eprintln!("scry: {message}");
     }
 }
