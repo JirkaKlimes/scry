@@ -641,9 +641,11 @@ impl Engine {
                     let cands = self.read_text(self.admit(chunk, false, Some(&mut seen)));
                     self.progress.done.fetch_add(n, Relaxed);
                     if !self.emit(cands, sink) {
-                        // An image that waits in the walk is not checked.
+                        // An image that waits in the walk is not checked. A wait for the next one
+                        // would hold up the exit when stdin sends paths slowly.
                         let full = sink.left == Some(0);
-                        self.stopped(sink, full && (sink.refused || paths.recv().is_ok()));
+                        let left = sink.refused || paths.try_recv().is_ok();
+                        self.stopped(sink, full && left);
                         break;
                     }
                 }
