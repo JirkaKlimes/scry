@@ -232,14 +232,29 @@ impl Progress {
         self.stage.load(Relaxed) == Stage::Watch as u8
     }
 
+    fn fail(&self, path: Option<&Path>, reason: &dyn fmt::Display) {
+        if self.tells() {
+            report::unreadable(path, &format!("{reason:#}"));
+        }
+        self.unreadable.add(path, reason);
+    }
+
+    /// An image in a format that scry cannot read.
+    fn skip(&self, path: &Path) {
+        if self.tells() {
+            let message = format!(
+                "skipped {}: scry cannot read this format yet",
+                clean_path(path)
+            );
+            report::warn(report::Code::Unsupported, &message);
+        }
+        self.unsupported.fetch_add(1, Relaxed);
+    }
+
     /// A --watch run tells at once, because it ends only when it is stopped. The picker owns
     /// the terminal, so it gets the notes at the end.
-    fn fail(&self, path: Option<&Path>, reason: &dyn fmt::Display) {
-        if self.live() && !pick::active() {
-            report::unreadable(path, &format!("{reason:#}"));
-        } else {
-            self.unreadable.add(path, reason);
-        }
+    fn tells(&self) -> bool {
+        self.live() && !pick::active()
     }
 
     /// `listed` counts the candidates of the text stage.
@@ -435,8 +450,8 @@ fn counted(found: Receiver<Found>, progress: Arc<Progress>, live: bool) -> Recei
         for item in found {
             let path = match item {
                 Found::Image(path) => path,
-                Found::Unsupported => {
-                    progress.unsupported.fetch_add(1, Relaxed);
+                Found::Unsupported(path) => {
+                    progress.skip(&path);
                     continue;
                 }
                 Found::Error { path, reason } => {
