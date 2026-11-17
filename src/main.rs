@@ -17,11 +17,21 @@ use std::{
     cell::Cell,
     panic::{self, AssertUnwindSafe},
     process::ExitCode,
-    sync::atomic::{AtomicUsize, Ordering::Relaxed},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
+    thread,
 };
 
 use anyhow::{Result, anyhow};
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGTERM},
+    iterator::Signals,
+    low_level::emulate_default_handler,
+};
 
+use cache::Cache;
 use cli::Mode;
 use pick::Exit;
 
@@ -64,6 +74,20 @@ fn run() -> Result<ExitCode> {
         (false, true) => ExitCode::from(2),
     })
 }
+/// A stopped scry keeps the work since the last cache commit and leaves the terminal as it was.
+/// Then it dies by the same signal, so that a shell loop that gets Ctrl-C also stops.
+pub fn stop_on_signals(cache: Arc<Cache>) -> Result<()> {
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+    thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            cache.flush();
+            pick::restore();
+            let _ = emulate_default_handler(signal);
+        }
+    });
+    Ok(())
+}
+
 
 thread_local! {
     static GUARDS: Cell<usize> = const { Cell::new(0) };

@@ -2869,6 +2869,7 @@ dependencies = [
  "rten",
  "rustix 1.1.6",
  "sha2",
+ "signal-hook",
  "tokenizers",
  "tract",
  "ureq",

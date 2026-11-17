@@ -15,7 +15,10 @@ use std::{
     panic,
     path::{Path, PathBuf},
     process::Child,
-    sync::{atomic::Ordering::Relaxed, mpsc::TryRecvError},
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        mpsc::TryRecvError,
+    },
     task::Poll,
     thread,
     time::{Duration, Instant},
@@ -136,6 +139,7 @@ pub fn run(search: Search, view: View, binds: Vec<Bind>) -> Result<Exit> {
 /// Like `ratatui::init`, but without its panic hook, which restores the terminal on a panic in
 /// any thread.
 fn init() -> io::Result<DefaultTerminal> {
+    ACTIVE.store(true, Relaxed);
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
     Terminal::new(CrosstermBackend::new(io::stdout()))
@@ -182,10 +186,21 @@ impl Drop for TtyStdio {
     }
 }
 
+/// True while the picker owns the terminal.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Puts the terminal back when a signal stops scry during the picker.
+pub fn restore() {
+    if ACTIVE.load(Relaxed) {
+        ratatui::restore();
+    }
+}
+
 struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
+        ACTIVE.store(false, Relaxed);
         ratatui::restore();
     }
 }
