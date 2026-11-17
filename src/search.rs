@@ -469,7 +469,10 @@ fn counted(found: Receiver<Found>, progress: Arc<Progress>, live: bool) -> Recei
                     continue;
                 }
             };
-            progress.found.fetch_add(1, Relaxed);
+            // The live phase counts each image once, after the engine drops the repeats.
+            if !live {
+                progress.found.fetch_add(1, Relaxed);
+            }
             if tx.send(path).is_err() {
                 break;
             }
@@ -707,6 +710,7 @@ impl Engine {
                 });
             }
             self.progress.done.fetch_add(cands.len(), Relaxed);
+            self.progress.found.fetch_add(cands.len(), Relaxed);
             if let Order::Ranked(ranker, ..) = &self.order {
                 cands = (self.rank(ranker, cands)?.into_iter())
                     .map(|(score, mut c)| {
