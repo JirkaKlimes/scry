@@ -131,7 +131,7 @@ scry --json -n 1 -q "a red car" ~/Pictures
 {"type":"end","matched":1,"truncated":true,"found":1311,"unsupported":0,"unreadable":0}
 ```
 
-Each run ends with one `end` or one `error` line. Matches come in their final order. `date` is the date that `--date` and `--sort date` use: `taken` from EXIF, else the time the file changed. `taken` and `date` are local time. `modified` is UTC. A path that is not UTF-8 also comes as base64 in `path_bytes`. The exit status is 0 when the run ends, also with no match, and 2 on an error. New fields, types and codes can come in later versions, so ignore the ones you do not know. To pass a query that starts with `-`, write `--query=TEXT`.
+Each run ends with one `end` or one `error` line, and the `end` line closes the progress. Download lines come during the `load` stage. Matches come in their final order. Split the output at `\n` only: a file name can hold other line breaks. `date` is the date that `--date` and `--sort date` use: `taken` from EXIF, else the time the file changed. `taken` and `date` are local time. `modified` is UTC. A path that is not UTF-8 also comes as base64 in `path_bytes`. The exit status is 0 when the run ends, also with no match, and 2 on an error. New fields, types and codes can come in later versions, so ignore the ones you do not know. To pass a query that starts with `-`, write `--query=TEXT`.
 
 ## How it works
 
