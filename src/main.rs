@@ -67,11 +67,10 @@ fn run() -> Result<ExitCode> {
     let Some(printed) = printed else {
         return Ok(ExitCode::from(130));
     };
-    let failed = progress.errors.load(Relaxed) > 0;
-    Ok(match (printed, failed) {
-        (true, _) => ExitCode::SUCCESS,
-        (false, false) => ExitCode::FAILURE,
-        (false, true) => ExitCode::from(2),
+    Ok(if printed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     })
 }
 /// A stopped scry keeps the work since the last cache commit and leaves the terminal as it was.

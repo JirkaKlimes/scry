@@ -319,7 +319,7 @@ impl Core {
             return;
         }
         zoom.image
-            .poll(|thumb| protocol(&self.picker, &self.search.progress, thumb));
+            .poll(|thumb| protocol(&self.picker, &self.search.progress, &zoom.path, thumb));
     }
 
     fn toggle_mark(&mut self, path: PathBuf) {
@@ -789,12 +789,10 @@ fn draw_label(frame: &mut Frame, area: Rect, text: &str, style: Style) {
 
 /// Call only right before a draw that shows the image. A kitty image waits in shared memory
 /// until the terminal reads it, and only the terminal frees it.
-fn protocol(picker: &Picker, progress: &Progress, thumb: Thumb) -> Option<Protocol> {
+fn protocol(picker: &Picker, progress: &Progress, path: &Path, thumb: Thumb) -> Option<Protocol> {
     picker
         .new_protocol(thumb.image, thumb.cells, Resize::Fit(None))
-        .inspect_err(|_| {
-            progress.errors.fetch_add(1, Relaxed);
-        })
+        .inspect_err(|e| progress.unreadable.add(Some(path), e))
         .ok()
 }
 

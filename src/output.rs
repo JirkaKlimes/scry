@@ -152,11 +152,7 @@ fn closed(out: impl AsFd) -> bool {
 pub fn notes(progress: &Progress, skipped: Option<Skipped>) {
     let count = |n: &AtomicUsize| n.load(Relaxed);
     let files = |n| if n == 1 { "file" } else { "files" };
-    let (found, unsupported, errors) = (
-        count(&progress.found),
-        count(&progress.unsupported),
-        count(&progress.errors),
-    );
+    let (found, unsupported) = (count(&progress.found), count(&progress.unsupported));
     let mut notes = String::new();
     if unsupported > 0 {
         notes += &format!(
@@ -165,8 +161,17 @@ pub fn notes(progress: &Progress, skipped: Option<Skipped>) {
             files(unsupported)
         );
     }
-    if errors > 0 {
-        notes += &format!("scry: skipped {errors} unreadable {}\n", files(errors));
+    let first = progress.unreadable.first();
+    for failure in first.iter() {
+        let reason = clean(&failure.reason);
+        notes += &match &failure.path {
+            Some(path) => format!("scry: cannot read {}: {reason}\n", clean_path(path)),
+            None => format!("scry: {reason}\n"),
+        };
+    }
+    let more = progress.unreadable.count() - first.len();
+    if more > 0 {
+        notes += &format!("scry: skipped {more} more unreadable {}\n", files(more));
     }
     if let Some(e) = embed::gpu::failure() {
         notes += &format!("scry: used the CPU, because the GPU failed: {e}\n");

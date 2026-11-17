@@ -55,8 +55,8 @@ Environment:
                gpu: any GPU, also an integrated one. An error if there is none
                cpu: only the CPU
 
-Exit status: 0 if scry printed a path, else 1. 2 on error, or if scry printed nothing and \
-skipped an unreadable file. 130 if you quit scatter or grid mode.
+Exit status: 0 if scry printed a path, else 1. 2 on error. 130 if you quit scatter or grid \
+mode. Files that scry cannot read do not change it.
 
 Examples:
   scry -q 'a dog in the snow' ~/Pictures

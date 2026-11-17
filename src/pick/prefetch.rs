@@ -2,13 +2,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::Ordering::Relaxed,
         mpsc::{self, Receiver, TryRecvError},
     },
     task::Poll,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use image::{DynamicImage, Rgba, imageops::FilterType};
 use ratatui::layout::Size;
 use ratatui_image::FontSize;
@@ -55,7 +54,8 @@ impl Shape {
 /// A thumbnail on its way from a worker. Dropping the ticket cancels the work that has not
 /// started yet, so the images in view do not wait behind images that are gone.
 pub struct Ticket {
-    thumb: Receiver<Option<Thumb>>,
+    thumb: Receiver<Result<Thumb>>,
+    path: PathBuf,
     /// The worker checks that this is alive before each slow step.
     _wanted: Arc<()>,
     progress: Arc<Progress>,
@@ -65,15 +65,14 @@ impl Ticket {
     /// The thumbnail once the worker is done, or `None` if the image cannot be shown. A failure
     /// counts as an unreadable file. Poll until the ticket is ready, then drop it.
     pub fn poll(&self) -> Poll<Option<Thumb>> {
-        let thumb = match self.thumb.try_recv() {
+        let failure = match self.thumb.try_recv() {
             Err(TryRecvError::Empty) => return Poll::Pending,
-            Ok(thumb) => thumb,
-            Err(TryRecvError::Disconnected) => None,
+            Ok(Ok(thumb)) => return Poll::Ready(Some(thumb)),
+            Ok(Err(e)) => e,
+            Err(TryRecvError::Disconnected) => anyhow!("crashed"),
         };
-        if thumb.is_none() {
-            self.progress.errors.fetch_add(1, Relaxed);
-        }
-        Poll::Ready(thumb)
+        self.progress.unreadable.add(Some(&self.path), failure);
+        Poll::Ready(None)
     }
 }
 
@@ -105,29 +104,37 @@ impl Prefetch {
         let (tx, rx) = mpsc::sync_channel(1);
         let wanted = Arc::new(());
         let (font, edge, weak) = (self.font, self.edge, Arc::downgrade(&wanted));
-        self.pool
-            .spawn(move || _ = tx.send(thumbnail(&path, shape, font, edge, &weak)));
+        let job = path.clone();
+        self.pool.spawn(move || {
+            if let Some(thumb) = thumbnail(&job, shape, font, edge, &weak) {
+                _ = tx.send(thumb);
+            }
+        });
         Ticket {
             thumb: rx,
+            path,
             _wanted: wanted,
             progress: self.progress.clone(),
         }
     }
 }
 
-/// `None` if the image cannot be shown, or once nobody wants it.
+/// `None` once nobody wants it.
 fn thumbnail(
     path: &Path,
     shape: Shape,
     font: FontSize,
     edge: Rgba<u8>,
     wanted: &Weak<()>,
-) -> Option<Thumb> {
+) -> Option<Result<Thumb>> {
     let alive = || wanted.strong_count() > 0;
     if !alive() {
         return None;
     }
-    let image = decode::load(path, shape.side(font)).ok()?;
+    let image = match decode::load(path, shape.side(font)) {
+        Ok(image) => image,
+        Err(e) => return Some(Err(e)),
+    };
     if !alive() {
         return None;
     }
@@ -147,10 +154,10 @@ fn thumbnail(
             *pixel = edge;
         }
     }
-    Some(Thumb {
+    Some(Ok(Thumb {
         image: image.into(),
         cells,
-    })
+    }))
 }
 
 /// Size in cells for an image of `image` pixels in cells of `font` pixels: the image's own

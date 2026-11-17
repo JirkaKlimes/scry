@@ -35,7 +35,10 @@ pub enum Found {
     /// An image in a format that scry cannot read.
     Unsupported,
     /// A file or directory that scry cannot read.
-    Error,
+    Error {
+        path: Option<PathBuf>,
+        reason: String,
+    },
 }
 
 impl Found {
@@ -115,9 +118,15 @@ pub fn globs<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Result<Override
 
 fn read_list(input: impl BufRead, end: End, globs: &Override, tx: &Sender<Found>) {
     for line in input.split(end.byte()) {
-        let Ok(mut line) = line else {
-            let _ = tx.send(Found::Error);
-            return;
+        let mut line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                let _ = tx.send(Found::Error {
+                    path: None,
+                    reason: format!("cannot read the paths on stdin: {e}"),
+                });
+                return;
+            }
         };
         // A list from a Windows tool ends its lines with CRLF.
         if end == End::Newline && line.last() == Some(&b'\r') {
@@ -164,7 +173,7 @@ fn walk(dirs: &[PathBuf], opts: WalkOpts, tx: Sender<Found>) {
                         Some(found) if is_file(&e) => found,
                         _ => return WalkState::Continue,
                     },
-                    Err(_) => Found::Error,
+                    Err(e) => walk_error(e),
                 };
                 match tx.send(found) {
                     Ok(()) => WalkState::Continue,
@@ -173,6 +182,20 @@ fn walk(dirs: &[PathBuf], opts: WalkOpts, tx: Sender<Found>) {
             })
         })
     });
+}
+
+fn walk_error(e: ignore::Error) -> Found {
+    match e {
+        ignore::Error::WithPath { path, err } => Found::Error {
+            path: Some(path),
+            reason: err.to_string(),
+        },
+        ignore::Error::WithDepth { err, .. } => walk_error(*err),
+        e => Found::Error {
+            path: None,
+            reason: e.to_string(),
+        },
+    }
 }
 
 /// The path below the root that the walk started from. A glob like `Screenshots/*` matches
@@ -396,7 +419,9 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         // Root can read the directory anyway.
         if !readable {
-            let errors = found.iter().filter(|f| matches!(f, Found::Error));
+            let errors = found
+                .iter()
+                .filter(|f| matches!(f, Found::Error { path: Some(_), .. }));
             assert_eq!(errors.count(), 1);
             assert_eq!(found.into_iter().filter_map(image).count(), 2);
         }

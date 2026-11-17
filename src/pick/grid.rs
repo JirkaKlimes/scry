@@ -226,7 +226,7 @@ impl Board for Grid {
                 if self.images.contains_key(path) {
                     continue;
                 }
-                match protocol(&core.picker, &core.search.progress, thumb.clone()) {
+                match protocol(&core.picker, &core.search.progress, path, thumb.clone()) {
                     Some(image) => _ = self.images.insert(path.clone(), image),
                     None => _ = self.thumbs.insert(path.clone(), Loading::Failed),
                 }
