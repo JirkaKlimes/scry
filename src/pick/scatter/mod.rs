@@ -152,7 +152,9 @@ impl Scatter {
             self.feed.retry(prepared.hit);
             return false;
         };
-        let Some(image) = protocol(&core.picker, &core.search.progress, prepared.thumb) else {
+        let progress = &core.search.progress;
+        let Some(image) = protocol(&core.picker, progress, &prepared.hit.path, prepared.thumb)
+        else {
             return false;
         };
         let card = Card {

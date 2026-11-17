@@ -1,12 +1,12 @@
 use std::{
     cmp::Ordering,
     collections::HashSet,
-    fs, iter,
+    fmt, fs, iter,
     num::NonZeroUsize,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering::Relaxed},
         mpsc::{self, Receiver, Sender},
     },
@@ -96,8 +96,43 @@ impl Hit {
 pub struct Progress {
     pub found: AtomicUsize,
     pub done: AtomicUsize,
-    pub errors: AtomicUsize,
     pub unsupported: AtomicUsize,
+    pub unreadable: Unreadable,
+}
+
+/// Files that scry cannot read. The first few keep the path and the reason, for the notes at the
+/// end.
+#[derive(Default)]
+pub struct Unreadable {
+    count: AtomicUsize,
+    first: Mutex<Vec<Failure>>,
+}
+
+pub struct Failure {
+    /// None when the error does not name a file, as a failed read of stdin.
+    pub path: Option<PathBuf>,
+    pub reason: String,
+}
+
+impl Unreadable {
+    const KEPT: usize = 5;
+
+    pub fn add(&self, path: Option<&Path>, reason: impl fmt::Display) {
+        if self.count.fetch_add(1, Relaxed) < Self::KEPT {
+            self.first.lock().unwrap().push(Failure {
+                path: path.map(Path::to_path_buf),
+                reason: format!("{reason:#}"),
+            });
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(Relaxed)
+    }
+
+    pub fn first(&self) -> MutexGuard<'_, Vec<Failure>> {
+        self.first.lock().unwrap()
+    }
 }
 
 pub struct Search {
@@ -129,18 +164,18 @@ impl Search {
         let (cache, progress) = (self.cache.clone(), self.progress.clone());
         thread::spawn(move || {
             // False once nobody waits for the answers.
-            let answer = |i, embedding: Result<Vec<f32>>| {
-                if embedding.is_err() {
-                    progress.errors.fetch_add(1, Relaxed);
-                }
-                done.send(Ok((i, embedding.ok().map(Arc::from)))).is_ok()
+            let answer = |i, path: &Path, embedding: Result<Vec<f32>>| {
+                let embedding = embedding
+                    .inspect_err(|e| progress.unreadable.add(Some(path), e))
+                    .ok();
+                done.send(Ok((i, embedding.map(Arc::from)))).is_ok()
             };
             for chunk in ready_chunks(&paths, CHUNK) {
                 let mut keys = Vec::new();
                 for (i, path) in chunk {
                     match fs::metadata(&path) {
                         Ok(md) => keys.push((i, Key::new(&path, &md))),
-                        Err(e) => _ = answer(i, Err(e.into())),
+                        Err(e) => _ = answer(i, &path, Err(e.into())),
                     }
                 }
                 let readable: Vec<&Key> = keys.iter().map(|(_, key)| key).collect();
@@ -155,8 +190,8 @@ impl Search {
                         return;
                     }
                 };
-                for ((i, _), embedding) in keys.iter().zip(embedded) {
-                    if !answer(*i, embedding) {
+                for ((i, key), embedding) in keys.iter().zip(embedded) {
+                    if !answer(*i, key.path(), embedding) {
                         return;
                     }
                 }
@@ -254,8 +289,8 @@ fn counted(found: Receiver<Found>, progress: Arc<Progress>) -> Receiver<PathBuf>
                     progress.unsupported.fetch_add(1, Relaxed);
                     continue;
                 }
-                Found::Error => {
-                    progress.errors.fetch_add(1, Relaxed);
+                Found::Error { path, reason } => {
+                    progress.unreadable.add(path.as_deref(), reason);
                     continue;
                 }
             };
@@ -474,20 +509,23 @@ impl Engine {
         let view = self.cache.view();
         let mut cands: Vec<Cand> = paths
             .into_par_iter()
-            .filter_map(|path| self.ok(self.admit_one(&view, path, dated)).flatten())
+            .filter_map(|path| {
+                self.ok(&path, self.admit_one(&view, &path, dated))
+                    .flatten()
+            })
             .collect();
         // Overlapping paths find a file twice. The first path wins, so threads do not decide.
         cands.retain(|c| seen.insert(c.id));
         cands
     }
 
-    fn admit_one(&self, view: &View, path: PathBuf, dated: bool) -> Result<Option<Cand>> {
-        let md = fs::metadata(&path)?;
+    fn admit_one(&self, view: &View, path: &Path, dated: bool) -> Result<Option<Cand>> {
+        let md = fs::metadata(path)?;
         decode::check(&md)?;
-        let key = Key::new(&path, &md);
+        let key = Key::new(path, &md);
         let mut date = None;
         if dated || self.filter.needs_meta() {
-            let meta = view.meta(&key, || meta::read(&path))?;
+            let meta = view.meta(&key, || meta::read(path))?;
             let modified = md.modified()?;
             if !self.filter.check(&meta, modified) {
                 return Ok(None);
@@ -497,7 +535,7 @@ impl Engine {
         Ok(Some(Cand {
             key,
             id: (md.dev(), md.ino()),
-            hit: Hit::new(path),
+            hit: Hit::new(path.to_path_buf()),
             date,
         }))
     }
@@ -510,7 +548,7 @@ impl Engine {
             .into_iter()
             .zip(embeddings)
             .filter_map(|(mut c, embedding)| {
-                let embedding = self.ok(embedding)?;
+                let embedding = self.ok(&c.hit.path, embedding)?;
                 let score = ranker.score(&embedding)?;
                 if ranker.embeddings {
                     c.hit.embedding = Some(embedding.into());
@@ -528,7 +566,7 @@ impl Engine {
         cands
             .into_par_iter()
             .filter_map(|mut c| {
-                let text = self.ok(view.ocr(&c.key, || ocr.read(&c.hit.path)))?;
+                let text = self.ok(&c.hit.path, view.ocr(&c.key, || ocr.read(&c.hit.path)))?;
                 if !self.text.iter().all(|re| re.is_match(&text)) {
                     return None;
                 }
@@ -552,12 +590,10 @@ impl Engine {
             .collect()
     }
 
-    /// Like `Result::ok`, but counts the error.
-    fn ok<T>(&self, result: Result<T>) -> Option<T> {
+    /// Like `Result::ok`, but records the error.
+    fn ok<T>(&self, path: &Path, result: Result<T>) -> Option<T> {
         result
-            .inspect_err(|_| {
-                self.progress.errors.fetch_add(1, Relaxed);
-            })
+            .inspect_err(|e| self.progress.unreadable.add(Some(path), e))
             .ok()
     }
 }
