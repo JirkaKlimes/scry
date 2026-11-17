@@ -10,7 +10,10 @@ use indicatif::{DecimalBytes, ProgressBar, ProgressStyle};
 use rten::Model;
 use sha2::{Digest, Sha256};
 
-use crate::{cache, output::clean_path};
+use crate::{
+    cache,
+    output::{self, ProgressLines, clean_path},
+};
 
 pub struct Asset {
     /// For people, like "SigLIP 2 image model".
@@ -81,7 +84,10 @@ pub fn cannot_load(path: &Path) -> String {
 fn download(asset: &Asset, file: &mut File, dir: &Path) -> Result<()> {
     let mut resp = agent().get(asset.url).call().context(asset.url)?;
     let bar = progress(asset, resp.body().content_length(), dir)?;
-    let sha256 = copy_hashed(bar.wrap_read(resp.body_mut().as_reader()), file)?;
+    let mut lines = ProgressLines::start();
+    let sha256 = copy_hashed(bar.wrap_read(resp.body_mut().as_reader()), file, || {
+        lines.print(|| downloaded(asset, &bar));
+    })?;
     file.sync_all()?;
     bar.finish_and_clear();
     ensure!(
@@ -122,7 +128,26 @@ fn progress(asset: &Asset, size: Option<u64>, dir: &Path) -> Result<ProgressBar>
         .with_message(asset.label))
 }
 
-fn copy_hashed(mut from: impl Read, to: &mut impl Write) -> io::Result<String> {
+/// Text like "downloading the SigLIP 2 text model, 120 MB/270 MB, about 30 seconds left".
+fn downloaded(asset: &Asset, bar: &ProgressBar) -> String {
+    let total = (bar.length())
+        .filter(|&n| n > 0)
+        .map(|n| format!("/{}", DecimalBytes(n)))
+        .unwrap_or_default();
+    format!(
+        "downloading the {}, {}{total}{}",
+        asset.label,
+        DecimalBytes(bar.position()),
+        output::left(bar)
+    )
+}
+
+/// Runs `copied` after each chunk.
+fn copy_hashed(
+    mut from: impl Read,
+    to: &mut impl Write,
+    mut copied: impl FnMut(),
+) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0; 1 << 16];
     loop {
@@ -132,6 +157,7 @@ fn copy_hashed(mut from: impl Read, to: &mut impl Write) -> io::Result<String> {
         }
         hasher.update(&buf[..n]);
         to.write_all(&buf[..n])?;
+        copied();
     }
     Ok(hasher
         .finalize()

@@ -10,10 +10,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         LazyLock,
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
         mpsc::{Receiver, RecvTimeoutError, TryRecvError},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -79,12 +79,15 @@ pub fn list(search: Search, opts: &ListOpts) -> Result<usize> {
     // A sorted search sees all images before the first hit, so progress shows until then.
     let spinner = ProgressBar::new_spinner();
     spinner.enable_steady_tick(TICK);
+    let mut lines = ProgressLines::start();
     let mut hit = next(
         &search.hits,
         || Ok(true),
         || {
             let left = time_left(&spinner, &search.progress);
-            spinner.set_message(format!("{}{left}", search.status()));
+            let status = format!("{}{left}", search.status());
+            lines.print(|| status.clone());
+            spinner.set_message(status);
         },
     )?;
     spinner.finish_and_clear();
@@ -200,10 +203,62 @@ pub fn time_left(bar: &ProgressBar, progress: &Progress) -> String {
     let (done, found) = (progress.done.load(Relaxed), progress.found.load(Relaxed));
     bar.set_length(found as u64);
     bar.set_position(done as u64);
-    if done == 0 || done == found || bar.elapsed() < Duration::from_secs(3) {
+    left(bar)
+}
+
+/// Text like ", about 3 minutes left" once the estimate in `bar` has enough data.
+pub fn left(bar: &ProgressBar) -> String {
+    let done = bar.position();
+    if done == 0
+        || bar.length().is_none_or(|len| done >= len)
+        || bar.elapsed() < Duration::from_secs(3)
+    {
         return String::new();
     }
     format!(", about {} left", HumanDuration(bar.eta()))
+}
+
+/// Set by --progress when stderr is not a terminal, where the bars draw nothing.
+static PROGRESS_LINES: AtomicBool = AtomicBool::new(false);
+
+const LINE_EVERY: Duration = Duration::from_secs(1);
+
+pub fn print_progress_lines() {
+    PROGRESS_LINES.store(!io::stderr().is_terminal(), Relaxed);
+}
+
+/// The progress for --progress, as a line a second on stderr, so a program that runs scry can
+/// show the latest line. The first line comes after a second, so a fast search prints none.
+pub struct ProgressLines {
+    next: Option<Instant>,
+}
+
+impl ProgressLines {
+    pub fn start() -> Self {
+        let next = PROGRESS_LINES
+            .load(Relaxed)
+            .then(|| Instant::now() + LINE_EVERY);
+        Self { next }
+    }
+
+    pub fn print(&mut self, line: impl FnOnce() -> String) {
+        if self.due(Instant::now()) {
+            // stderr is unbuffered: one write keeps the line whole. A closed stderr must not end
+            // the search, so the error goes nowhere.
+            let _ = io::stderr().write_all(format!("scry: {}\n", line()).as_bytes());
+        }
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        let Some(next) = &mut self.next else {
+            return false;
+        };
+        if now < *next {
+            return false;
+        }
+        *next = now + LINE_EVERY;
+        true
+    }
 }
 
 /// Asks the terminal which image protocol it supports. Kitty can read images from shared memory,
@@ -514,6 +569,19 @@ mod tests {
             b"evil?gpj.exe\n"
         );
         assert_eq!(clean("tab\there\u{2066}").to_string(), "tab?here?");
+    }
+
+    #[test]
+    fn progress_lines_come_once_a_second() {
+        let start = Instant::now();
+        let mut lines = ProgressLines {
+            next: Some(start + LINE_EVERY),
+        };
+        assert!(!lines.due(start));
+        assert!(lines.due(start + LINE_EVERY));
+        assert!(!lines.due(start + LINE_EVERY + Duration::from_millis(900)));
+        assert!(lines.due(start + LINE_EVERY * 2 + Duration::from_millis(100)));
+        assert!(!ProgressLines { next: None }.due(start + LINE_EVERY * 10));
     }
 
     #[test]

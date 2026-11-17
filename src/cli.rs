@@ -200,6 +200,10 @@ struct Args {
     /// Separate paths with NUL instead of newline, on stdin and stdout
     #[arg(short = '0', long, help_heading = "Output")]
     null: bool,
+
+    /// Print the progress to stderr also when it is not a terminal, as a line a second
+    #[arg(long, conflicts_with = "view", help_heading = "Output")]
+    progress: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -220,6 +224,9 @@ impl Args {
         }
         let text = regexes(&self.text, self.ignore_case)?;
         let globs = globs(&self.glob)?;
+        if self.progress {
+            output::print_progress_lines();
+        }
         let view = match (self.scatter, self.grid) {
             (true, _) => Some(View::Scatter),
             (_, true) => Some(View::Grid),
@@ -544,6 +551,7 @@ mod tests {
             err(&["--grid", "-S", "-q", "cat"]),
             ErrorKind::ArgumentConflict
         );
+        assert_eq!(err(&["--grid", "--progress"]), ErrorKind::ArgumentConflict);
         assert_eq!(err(&["--width", "big"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--date", "7d"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["-t", "a[b"]), ErrorKind::ValueValidation);
