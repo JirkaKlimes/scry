@@ -221,8 +221,18 @@ impl Follower {
     /// False once nobody takes the images.
     fn handle(&mut self, root: usize, path: &Path) -> bool {
         // Gone, as a temporary file that was renamed.
-        let Ok(md) = fs::metadata(path) else {
+        let Ok(md) = fs::symlink_metadata(path) else {
             return true;
+        };
+        // A new link to an old file is new.
+        let changed = changed_since(&md, self.since);
+        // As in the walk, a link to a file counts, and a link to a directory is not followed.
+        let md = match md.is_symlink() {
+            true => match fs::metadata(path) {
+                Ok(target) if target.is_file() => target,
+                _ => return true,
+            },
+            false => md,
         };
         let below = (path.strip_prefix(&self.roots[root].given))
             .expect("local paths start with their root")
@@ -240,7 +250,7 @@ impl Follower {
         if !md.is_file() || md.len() == 0 {
             return true;
         }
-        if self.mode == Watch::New && !changed_since(&md, self.since) {
+        if self.mode == Watch::New && !changed {
             return true;
         }
         Found::new(path).is_none_or(|found| self.tx.send(found).is_ok())
