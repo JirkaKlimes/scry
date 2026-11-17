@@ -110,8 +110,8 @@ pub struct Hit {
     pub embedding: Option<Arc<[f32]>>,
     /// With `show_text`.
     pub text: Option<String>,
-    /// Each match of each text pattern. Empty matches are left out, as in grep -o.
-    pub matches: Vec<String>,
+    /// With text patterns: each match of each one. Empty matches are left out, as in grep -o.
+    pub matches: Option<Vec<String>>,
     /// With `describe`.
     pub file: Option<FileInfo>,
 }
@@ -123,7 +123,7 @@ impl Hit {
             score: None,
             embedding: None,
             text: None,
-            matches: Vec::new(),
+            matches: None,
             file: None,
         }
     }
@@ -137,14 +137,6 @@ pub struct FileInfo {
 }
 
 impl FileInfo {
-    /// Without the cache, for the few images that a picker returns.
-    pub fn read(path: &Path) -> Result<Self> {
-        Ok(Self {
-            meta: meta::read(path).ok(),
-            modified: fs::metadata(path)?.modified()?,
-        })
-    }
-
     /// The date that --date and --sort date use.
     pub fn date(&self) -> Option<DateTime> {
         match &self.meta {
@@ -899,7 +891,7 @@ impl Engine {
                 if !self.text.iter().all(|re| re.is_match(&text)) {
                     return None;
                 }
-                c.hit.matches = self.matches(&text);
+                c.hit.matches = (!self.text.is_empty()).then(|| self.matches(&text));
                 if self.show_text {
                     c.hit.text = Some(text);
                 }

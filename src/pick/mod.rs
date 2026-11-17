@@ -7,6 +7,7 @@ mod scatter;
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     fmt,
     io::{self, Write},
     mem,
@@ -74,7 +75,7 @@ pub enum View {
 }
 
 pub enum Exit {
-    Picked(Vec<PathBuf>),
+    Picked(Vec<Hit>),
     /// The search found nothing to show.
     Empty,
     Aborted,
@@ -272,6 +273,8 @@ struct Core {
     /// The area for images, above the status line.
     bounds: Rect,
     marks: Vec<PathBuf>,
+    /// The hits by path, so a pick returns their score and metadata.
+    found: HashMap<PathBuf, Hit>,
     zoom: Option<Zoom>,
     /// The kitty images that the frame in progress sends.
     transmits: RefCell<Vec<kitty::Transmit>>,
@@ -293,6 +296,7 @@ impl Core {
             searching: true,
             bounds: Rect::ZERO,
             marks: Vec::new(),
+            found: HashMap::new(),
             zoom: None,
             transmits: RefCell::default(),
         })
@@ -302,7 +306,11 @@ impl Core {
     fn drain(&mut self, mut push: impl FnMut(Hit)) -> Result<()> {
         while self.searching {
             match self.search.hits.try_recv() {
-                Ok(hit) => push(hit?),
+                Ok(hit) => {
+                    let hit = hit?;
+                    self.found.insert(hit.path.clone(), hit.clone());
+                    push(hit);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => self.searching = false,
             }
@@ -334,6 +342,17 @@ impl Core {
             Some(i) => _ = self.marks.remove(i),
             None => self.marks.push(path),
         }
+    }
+
+    fn hits(&self, paths: Vec<PathBuf>) -> Vec<Hit> {
+        (paths.into_iter())
+            .map(|path| {
+                self.found
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or_else(|| Hit::new(path))
+            })
+            .collect()
     }
 
     fn marked(&self, path: &Path) -> bool {
@@ -618,7 +637,7 @@ impl<B: Board> App<B> {
         match key.code {
             KeyCode::Esc => return Break(Exit::Aborted),
             KeyCode::Enter => match self.picked() {
-                Some(paths) => return Break(Exit::Picked(paths)),
+                Some(paths) => return Break(Exit::Picked(self.core.hits(paths))),
                 None => self.board.key(&mut self.core, KeyCode::Enter),
             },
             KeyCode::Tab => {
@@ -687,7 +706,8 @@ impl<B: Board> App<B> {
                 if !self.core.marked(&zoom.path) {
                     self.core.marks.push(zoom.path);
                 }
-                return Break(Exit::Picked(mem::take(&mut self.core.marks)));
+                let marks = mem::take(&mut self.core.marks);
+                return Break(Exit::Picked(self.core.hits(marks)));
             }
             KeyCode::Tab => {
                 self.core.toggle_mark(zoom.path.clone());
