@@ -130,7 +130,8 @@ static CALENDAR: LazyLock<Regex> = LazyLock::new(|| {
 /// The shape of the text picks the kind of bound. The jiff parsers accept too much to try them
 /// in turn: "2024" parses as the time 20:24.
 fn time_bound(s: &str, now: &Zoned) -> Result<Bound<DateTime>, String> {
-    let is_age = |s: &str| AGE.is_match(s);
+    // "2024z" has the shape of an age, but no unit.
+    let is_age = |s: &str| AGE.is_match(s) && s.parse::<Span>().is_ok();
     let day = |d: Date| Some(Bound::Period(d.into(), d.tomorrow().ok()?.into()));
     let bound = match s {
         "today" => day(now.date()),
@@ -430,6 +431,7 @@ mod tests {
         let case = "units are lowercase: mo for months, m for minutes";
         assert_eq!(err("3M"), case);
         assert_eq!(err("7D.."), case);
+        assert!(err("2024Z").contains("is not a date"));
         assert_eq!(err("2025..2024"), "start is after end");
         assert_eq!(err("today..yesterday"), "start is after end");
         assert_eq!(err("7d..2025"), "start is after end");
