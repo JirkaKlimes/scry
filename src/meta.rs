@@ -22,8 +22,13 @@ impl Meta {
     /// When the photo was taken, else when the file last changed. Phone galleries do the same, so
     /// screenshots and downloads get a date too.
     pub fn date(&self, modified: SystemTime) -> Option<DateTime> {
-        (self.exif.taken).or_else(|| Some(Zoned::try_from(modified).ok()?.datetime()))
+        (self.exif.taken).or_else(|| local(modified))
     }
+}
+
+/// Wall-clock time in the local time zone.
+pub fn local(time: SystemTime) -> Option<DateTime> {
+    Some(Zoned::try_from(time).ok()?.datetime())
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

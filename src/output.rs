@@ -10,14 +10,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         LazyLock,
-        atomic::{AtomicUsize, Ordering::Relaxed},
         mpsc::{Receiver, RecvTimeoutError, TryRecvError},
     },
     time::Duration,
 };
 
 use anyhow::Result;
-use indicatif::{HumanDuration, ProgressBar};
 use ratatui::{
     backend::IntoCrossterm,
     buffer::Buffer,
@@ -43,15 +41,33 @@ use rustix::{
 };
 
 use crate::{
-    decode, embed,
-    search::{Hit, Progress, Search},
-    walk::Skipped,
+    decode, report,
+    search::{FileInfo, Hit, Search},
 };
 
 pub struct ListOpts {
-    pub score: bool,
-    pub preview: bool,
-    pub end: End,
+    pub out: Out,
+    /// The default limit, if it applies. The notes tell when it cuts the list.
+    pub cut: Option<usize>,
+}
+
+pub enum Out {
+    Lines {
+        score: bool,
+        preview: bool,
+        shown: Shown,
+        end: End,
+    },
+    /// `matches`: the search has text patterns.
+    Json { matches: bool },
+}
+
+/// What follows the path in a line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Shown {
+    Nothing,
+    Text,
+    Matches,
 }
 
 /// What ends each path on stdin and stdout.
@@ -73,28 +89,40 @@ impl End {
 const THUMB_ROWS: u16 = 10;
 const TICK: Duration = Duration::from_millis(100);
 
-pub fn list(search: Search, opts: &ListOpts) -> Result<usize> {
-    let mut out = Printer::stdout(opts.end);
-    let preview = (opts.preview && out.tty).then(Preview::new).transpose()?;
+/// Returns the number of printed matches.
+pub fn list(search: Search, out: &Out) -> Result<usize> {
+    match *out {
+        Out::Lines {
+            score,
+            preview,
+            shown,
+            end,
+        } => lines(search, score, preview, shown, end),
+        Out::Json { matches } => json(search, matches),
+    }
+}
+
+fn lines(search: Search, score: bool, preview: bool, shown: Shown, end: End) -> Result<usize> {
+    let mut out = Printer::stdout(end);
+    let preview = (preview && out.tty).then(Preview::new).transpose()?;
     // A sorted search sees all images before the first hit, so progress shows until then.
-    let spinner = ProgressBar::new_spinner();
-    spinner.enable_steady_tick(TICK);
     let mut hit = next(
         &search.hits,
         || Ok(true),
-        || {
-            let left = time_left(&spinner, &search.progress);
-            spinner.set_message(format!("{}{left}", search.status()));
-        },
+        || report::progress(&search.progress),
     )?;
-    spinner.finish_and_clear();
-
+    report::clear();
     let mut printed = 0;
     while let Some(h) = hit {
         if let Some(preview) = &preview {
             preview.show(&mut out.out, &h.path)?;
         }
-        if !out.record(h.score.filter(|_| opts.score), &h.path, &h.text)? {
+        let fields = match shown {
+            Shown::Nothing => &[],
+            Shown::Text => h.text.as_slice(),
+            Shown::Matches => h.matches.as_slice(),
+        };
+        if !out.record(h.score.filter(|_| score), &h.path, fields)? {
             return Ok(printed);
         }
         printed += 1;
@@ -104,7 +132,35 @@ pub fn list(search: Search, opts: &ListOpts) -> Result<usize> {
     Ok(printed)
 }
 
+fn json(search: Search, matches: bool) -> Result<usize> {
+    let tick = || report::progress(&search.progress);
+    let mut printed = 0;
+    let mut hit = next(&search.hits, || Ok(true), tick)?;
+    while let Some(h) = hit {
+        tick();
+        if !report::hit(&h, matches)? {
+            return Ok(printed);
+        }
+        printed += 1;
+        hit = next(&search.hits, || Ok(true), tick)?;
+    }
+    Ok(printed)
+}
+
+/// The images that a picker returns.
 pub fn paths(paths: &[PathBuf], end: End) -> io::Result<()> {
+    if report::json() {
+        for path in paths {
+            let hit = Hit {
+                file: FileInfo::read(path).ok(),
+                ..Hit::new(path.clone())
+            };
+            if !report::hit(&hit, false)? {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
     let mut out = Printer::stdout(end);
     for path in paths {
         if !out.record(None, path, &[])? {
@@ -146,69 +202,6 @@ fn closed(out: impl AsFd) -> bool {
     let mut fds = [PollFd::new(&out, PollFlags::OUT)];
     rustix::event::poll(&mut fds, Some(&Timespec::default()))
         .is_ok_and(|_| fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP))
-}
-
-/// Tells why images are missing from the output.
-pub fn notes(progress: &Progress, skipped: Option<Skipped>) {
-    let count = |n: &AtomicUsize| n.load(Relaxed);
-    let files = |n| if n == 1 { "file" } else { "files" };
-    let (found, unsupported) = (count(&progress.found), count(&progress.unsupported));
-    let mut notes = String::new();
-    if unsupported > 0 {
-        notes += &format!(
-            "scry: skipped {unsupported} {} {}: scry cannot read these formats yet\n",
-            decode::UNSUPPORTED,
-            files(unsupported)
-        );
-    }
-    let first = progress.unreadable.first();
-    for failure in first.iter() {
-        let reason = clean(&failure.reason);
-        notes += &match &failure.path {
-            Some(path) => format!("scry: cannot read {}: {reason}\n", clean_path(path)),
-            None => format!("scry: {reason}\n"),
-        };
-    }
-    let more = progress.unreadable.count() - first.len();
-    if more > 0 {
-        notes += &format!("scry: skipped {more} more unreadable {}\n", files(more));
-    }
-    if let Some(e) = embed::gpu::failure() {
-        notes += &format!("scry: used the CPU, because the GPU failed: {e}\n");
-        notes += "tip: set SCRY_DEVICE=cpu to skip the GPU.\n";
-    }
-    if found + unsupported == 0 {
-        notes += "scry: found no image files\n";
-        if let Some(skipped) = skipped {
-            notes += &skip_tip(skipped);
-        }
-    }
-    // stderr is unbuffered: one write keeps the lines whole next to stdout.
-    let _ = io::stderr().write_all(notes.as_bytes());
-}
-
-fn skip_tip(skipped: Skipped) -> String {
-    let (what, flags) = match skipped {
-        Skipped::Hidden => ("hidden files", "--hidden"),
-        Skipped::Ignored => ("the paths in .gitignore files", "--no-ignore"),
-        Skipped::Both => (
-            "hidden files and the paths in .gitignore files",
-            "--hidden and --no-ignore",
-        ),
-    };
-    format!("tip: scry skips {what}. Use {flags} to search them.\n")
-}
-
-/// Feeds the progress to the estimate in `bar`, and returns text like ", about 3 minutes left"
-/// once the estimate has enough data.
-pub fn time_left(bar: &ProgressBar, progress: &Progress) -> String {
-    let (done, found) = (progress.done.load(Relaxed), progress.found.load(Relaxed));
-    bar.set_length(found as u64);
-    bar.set_position(done as u64);
-    if done == 0 || done == found || bar.elapsed() < Duration::from_secs(3) {
-        return String::new();
-    }
-    format!(", about {} left", HumanDuration(bar.eta()))
 }
 
 /// Asks the terminal which image protocol it supports. Kitty can read images from shared memory,
@@ -333,7 +326,7 @@ impl<W: Write> Printer<W> {
 }
 
 /// A broken pipe is the normal end of `scry ... | head`.
-fn has_reader(written: io::Result<()>) -> io::Result<bool> {
+pub fn has_reader(written: io::Result<()>) -> io::Result<bool> {
     match written {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),

@@ -7,10 +7,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed},
         mpsc::{self, Receiver, Sender},
     },
     thread,
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result};
@@ -18,14 +19,16 @@ use image::DynamicImage;
 use jiff::civil::DateTime;
 use rayon::prelude::*;
 use regex::Regex;
+use serde::Serialize;
 
 use crate::{
     cache::{Cache, Key, View},
     catch, decode,
     embed::{self, ImageEmbedder, Prompt, TextEmbedder},
-    meta::{self, MetaFilter},
+    meta::{self, Meta, MetaFilter},
     ocr::Ocr,
     output::clean_path,
+    report,
     walk::{self, Found, Skipped, Source, WalkOpts},
 };
 
@@ -35,8 +38,10 @@ pub struct Query {
     pub meta: MetaFilter,
     /// All must match the text in the image.
     pub text: Vec<Regex>,
-    /// Hits carry the text in the image, or only the parts that match `text`.
+    /// Hits carry all the text in the image.
     pub show_text: bool,
+    /// Hits carry what the file tells about the image.
+    pub describe: bool,
     pub order: Order,
     pub limit: Option<NonZeroUsize>,
 }
@@ -100,8 +105,12 @@ pub struct Hit {
     pub path: PathBuf,
     pub score: Option<f32>,
     pub embedding: Option<Arc<[f32]>>,
-    /// With `show_text`: the text in the image, or the parts that match.
-    pub text: Vec<String>,
+    /// With `show_text`.
+    pub text: Option<String>,
+    /// Each match of each text pattern. Empty matches are left out, as in grep -o.
+    pub matches: Vec<String>,
+    /// With `describe`.
+    pub file: Option<FileInfo>,
 }
 
 impl Hit {
@@ -110,18 +119,123 @@ impl Hit {
             path,
             score: None,
             embedding: None,
-            text: Vec::new(),
+            text: None,
+            matches: Vec::new(),
+            file: None,
         }
     }
 }
 
-/// In a sorted search, `done` counts the images that have a score or a date. OCR comes after.
+#[derive(Clone)]
+pub struct FileInfo {
+    /// None if scry cannot read the header.
+    pub meta: Option<Meta>,
+    pub modified: SystemTime,
+}
+
+impl FileInfo {
+    /// Without the cache, for the few images that a picker returns.
+    pub fn read(path: &Path) -> Result<Self> {
+        Ok(Self {
+            meta: meta::read(path).ok(),
+            modified: fs::metadata(path)?.modified()?,
+        })
+    }
+
+    /// The date that --date and --sort date use.
+    pub fn date(&self) -> Option<DateTime> {
+        match &self.meta {
+            Some(meta) => meta.date(self.modified),
+            None => meta::local(self.modified),
+        }
+    }
+}
+
+/// `done` counts the images of the current stage.
 #[derive(Default)]
 pub struct Progress {
     pub found: AtomicUsize,
     pub done: AtomicUsize,
     pub unsupported: AtomicUsize,
     pub unreadable: Unreadable,
+    stage: AtomicU8,
+    /// The candidates of the text stage after a sort.
+    listed: AtomicUsize,
+    walked: AtomicBool,
+    truncated: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Stage {
+    Check,
+    Load,
+    Score,
+    Text,
+}
+
+/// How far a search is, at one moment.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Snapshot {
+    pub stage: Stage,
+    pub done: usize,
+    pub total: usize,
+    /// The walk still finds images, so `total` can grow.
+    pub walking: bool,
+}
+
+impl fmt::Display for Snapshot {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let verb = match self.stage {
+            Stage::Load => return f.write_str("loading the models"),
+            Stage::Check => "checked",
+            Stage::Score => "scored",
+            Stage::Text => "read",
+        };
+        write!(f, "{}/{} {verb}", self.done, self.total)
+    }
+}
+
+impl Progress {
+    pub fn found(&self) -> usize {
+        self.found.load(Relaxed)
+    }
+
+    pub fn unsupported(&self) -> usize {
+        self.unsupported.load(Relaxed)
+    }
+
+    /// The limit stopped the search before it sent or checked all images.
+    pub fn truncated(&self) -> bool {
+        self.truncated.load(Relaxed)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let stage = match self.stage.load(Relaxed) {
+            1 => Stage::Load,
+            2 => Stage::Score,
+            3 => Stage::Text,
+            _ => Stage::Check,
+        };
+        let total = match stage {
+            Stage::Text => self.listed.load(Relaxed),
+            _ => self.found(),
+        };
+        Snapshot {
+            stage,
+            done: self.done.load(Relaxed),
+            total,
+            walking: !self.walked.load(Relaxed),
+        }
+    }
+
+    /// `listed` counts the candidates of the text stage.
+    fn enter(&self, stage: Stage, listed: usize) {
+        self.listed.store(listed, Relaxed);
+        self.done.store(0, Relaxed);
+        self.stage.store(stage as u8, Relaxed);
+    }
 }
 
 /// Files that scry cannot read. The first few keep the path and the reason, for the notes at the
@@ -169,16 +283,6 @@ pub struct Search {
 }
 
 impl Search {
-    /// Progress for people, like "120/4000 scored".
-    pub fn status(&self) -> String {
-        let verb = match self.order {
-            Order::Ranked(..) => "scored",
-            Order::Found | Order::Sorted(..) => "checked",
-        };
-        let (done, found) = (&self.progress.done, &self.progress.found);
-        format!("{}/{} {verb}", done.load(Relaxed), found.load(Relaxed))
-    }
-
     /// Embeds images on a background thread, for a picker that ranks its hits again. Each answer
     /// carries the number that came with its path, and `None` for an image that cannot be read.
     /// An error ends the thread: the next images would fail the same way.
@@ -265,6 +369,11 @@ pub fn run(query: Query) -> Result<Search> {
     let paths = counted(walk.found, progress.clone());
     let cache = Arc::new(Cache::open()?);
     crate::stop_on_signals(cache.clone())?;
+    let reads_text = query.show_text || !query.text.is_empty();
+    if reads_text || matches!(query.order, Order::Ranked(..)) {
+        progress.enter(Stage::Load, 0);
+        report::progress(&progress);
+    }
     let (order, sort) = match query.order {
         Order::Found => (Order::Found, Order::Found),
         Order::Sorted(field, dir) => (Order::Sorted(field, dir), Order::Sorted(field, dir)),
@@ -273,9 +382,7 @@ pub fn run(query: Query) -> Result<Search> {
             Order::Ranked(Ranker::new(scoring, &cache)?, by, dir),
         ),
     };
-    let ocr = (query.show_text || !query.text.is_empty())
-        .then(Ocr::load)
-        .transpose()?;
+    let ocr = reads_text.then(Ocr::load).transpose()?;
     let (tx, hits) = mpsc::channel();
     let mut sink = Sink::new(tx, query.limit);
     let engine = Engine {
@@ -284,6 +391,7 @@ pub fn run(query: Query) -> Result<Search> {
         ocr,
         text: query.text,
         show_text: query.show_text,
+        describe: query.describe,
         order: sort,
         progress: progress.clone(),
     };
@@ -323,6 +431,7 @@ fn counted(found: Receiver<Found>, progress: Arc<Progress>) -> Receiver<PathBuf>
                 break;
             }
         }
+        progress.walked.store(true, Relaxed);
     });
     rx
 }
@@ -455,6 +564,7 @@ struct Engine {
     ocr: Option<Ocr>,
     text: Vec<Regex>,
     show_text: bool,
+    describe: bool,
     order: Order<Ranker>,
     progress: Arc<Progress>,
 }
@@ -463,20 +573,31 @@ struct Cand {
     key: Key,
     id: FileId,
     hit: Hit,
-    /// The date, when admission read the metadata.
-    date: Option<DateTime>,
+    modified: SystemTime,
+    /// When admission read it.
+    meta: Option<Meta>,
+}
+
+impl Cand {
+    fn date(&self) -> Option<DateTime> {
+        self.meta.as_ref()?.date(self.modified)
+    }
 }
 
 impl Engine {
     fn run(&self, paths: Receiver<PathBuf>, sink: &mut Sink) -> Result<()> {
         let mut seen = HashSet::new();
+        self.progress.enter(Stage::Check, 0);
         match &self.order {
             Order::Found => {
                 for chunk in ready_chunks(&paths, self.text_chunk()) {
                     let n = chunk.len();
                     let cands = self.read_text(self.admit(chunk, false, &mut seen));
                     self.progress.done.fetch_add(n, Relaxed);
-                    if !sink.send(cands.into_iter().map(|c| c.hit)) {
+                    if !self.emit(cands, sink) {
+                        // Images that wait in the walk are not checked.
+                        let left = paths.try_recv().is_ok() || !self.progress.walked.load(Relaxed);
+                        self.stopped(sink, left);
                         break;
                     }
                 }
@@ -489,6 +610,7 @@ impl Engine {
                 self.send_sorted(cands, sink);
             }
             Order::Ranked(ranker, by, dir) => {
+                self.progress.enter(Stage::Score, 0);
                 let dated = *by == By::Field(Field::Date);
                 let scored = self.gather(&paths, |chunk| {
                     self.rank(ranker, self.admit(chunk, dated, &mut seen))
@@ -497,13 +619,41 @@ impl Engine {
                 if (*by, *dir) == (By::Score, Dir::Natural) {
                     self.send_sorted(best, sink);
                 } else {
-                    let mut set = self.take(best, sink.left);
+                    let (mut set, left) = self.take(best, sink.left);
                     set.sort_by(|a, b| compare(*by, *dir, a, b));
-                    sink.send(set.into_iter().map(|c| c.hit));
+                    self.emit(set, sink);
+                    self.stopped(sink, left);
                 }
             }
         }
         Ok(())
+    }
+
+    fn emit(&self, mut cands: Vec<Cand>, sink: &mut Sink) -> bool {
+        self.describe(&mut cands);
+        sink.send(cands.into_iter().map(|c| c.hit))
+    }
+
+    /// `left`: candidates were left when the search stopped.
+    fn stopped(&self, sink: &Sink, left: bool) {
+        if sink.left == Some(0) && (left || sink.refused) {
+            self.progress.truncated.store(true, Relaxed);
+        }
+    }
+
+    fn describe(&self, cands: &mut [Cand]) {
+        if !self.describe {
+            return;
+        }
+        let view = self.cache.view();
+        cands.par_iter_mut().for_each(|c| {
+            let meta =
+                (c.meta.take()).or_else(|| view.meta(&c.key, || meta::read(&c.hit.path)).ok());
+            c.hit.file = Some(FileInfo {
+                meta,
+                modified: c.modified,
+            });
+        });
     }
 
     /// OCR is slow, so its chunks only fill the pool once: the first hit comes sooner.
@@ -528,26 +678,50 @@ impl Engine {
         Ok(all)
     }
 
-    /// The first `limit` candidates that pass the text filters. OCR stops there.
-    fn take(&self, cands: Vec<Cand>, limit: Option<usize>) -> Vec<Cand> {
+    /// The first `limit` candidates that pass the text filters, and whether others were left.
+    /// OCR stops there.
+    fn take(&self, cands: Vec<Cand>, limit: Option<usize>) -> (Vec<Cand>, bool) {
+        self.enter_text(cands.len());
         let mut set = Vec::new();
-        for chunk in chunks(cands.into_iter(), self.text_chunk()) {
-            set.extend(self.read_text(chunk));
+        let mut chunks = chunks(cands.into_iter(), self.text_chunk()).peekable();
+        while let Some(chunk) = chunks.next() {
+            set.extend(self.read_listed(chunk));
             if let Some(n) = limit.filter(|&n| set.len() >= n) {
+                let left = set.len() > n || chunks.peek().is_some();
                 set.truncate(n);
-                break;
+                return (set, left);
             }
         }
-        set
+        (set, false)
     }
 
     /// Sends sorted candidates in order, so a limit cuts OCR short.
-    fn send_sorted(&self, cands: impl IntoIterator<Item = Cand>, sink: &mut Sink) {
-        for chunk in chunks(cands.into_iter(), self.text_chunk()) {
-            if !sink.send(self.read_text(chunk).into_iter().map(|c| c.hit)) {
+    fn send_sorted(&self, cands: Vec<Cand>, sink: &mut Sink) {
+        self.enter_text(cands.len());
+        let mut chunks = chunks(cands.into_iter(), self.text_chunk()).peekable();
+        while let Some(chunk) = chunks.next() {
+            let passed = self.read_listed(chunk);
+            if !self.emit(passed, sink) {
+                self.stopped(sink, chunks.peek().is_some());
                 break;
             }
         }
+    }
+
+    /// A sorted list goes through OCR after the sort, as a stage of its own.
+    fn enter_text(&self, listed: usize) {
+        if self.ocr.is_some() {
+            self.progress.enter(Stage::Text, listed);
+        }
+    }
+
+    fn read_listed(&self, chunk: Vec<Cand>) -> Vec<Cand> {
+        let n = chunk.len();
+        let passed = self.read_text(chunk);
+        if self.ocr.is_some() {
+            self.progress.done.fetch_add(n, Relaxed);
+        }
+        passed
     }
 
     /// `dated` reads the metadata for a date even without a metadata filter.
@@ -569,20 +743,21 @@ impl Engine {
         let md = fs::metadata(path)?;
         decode::check(&md)?;
         let key = Key::new(path, &md);
-        let mut date = None;
+        let modified = md.modified()?;
+        let mut meta = None;
         if dated || self.filter.needs_meta() {
-            let meta = view.meta(&key, || meta::read(path))?;
-            let modified = md.modified()?;
-            if !self.filter.check(&meta, modified) {
+            let read = view.meta(&key, || meta::read(path))?;
+            if !self.filter.check(&read, modified) {
                 return Ok(None);
             }
-            date = meta.date(modified);
+            meta = Some(read);
         }
         Ok(Some(Cand {
             key,
             id: (md.dev(), md.ino()),
             hit: Hit::new(path.to_path_buf()),
-            date,
+            modified,
+            meta,
         }))
     }
 
@@ -616,21 +791,18 @@ impl Engine {
                 if !self.text.iter().all(|re| re.is_match(&text)) {
                     return None;
                 }
+                c.hit.matches = self.matches(&text);
                 if self.show_text {
-                    c.hit.text = self.shown(text);
+                    c.hit.text = Some(text);
                 }
                 Some(c)
             })
             .collect()
     }
 
-    /// All the text, or each match of each pattern. Empty matches show nothing, as in grep -o.
-    fn shown(&self, text: String) -> Vec<String> {
-        if self.text.is_empty() {
-            return vec![text];
-        }
+    fn matches(&self, text: &str) -> Vec<String> {
         (self.text.iter())
-            .flat_map(|re| re.find_iter(&text))
+            .flat_map(|re| re.find_iter(text))
             .filter(|m| !m.is_empty())
             .map(|m| m.as_str().to_owned())
             .collect()
@@ -659,7 +831,7 @@ fn compare(by: By, dir: Dir, a: &Cand, b: &Cand) -> Ordering {
     let score = |c: &Cand| c.hit.score.unwrap_or(f32::NEG_INFINITY);
     let natural = match by {
         By::Score => score(b).total_cmp(&score(a)),
-        By::Field(Field::Date) => b.date.cmp(&a.date),
+        By::Field(Field::Date) => b.date().cmp(&a.date()),
         By::Field(Field::Path) => a.hit.path.cmp(&b.hit.path),
     };
     let order = match dir {
@@ -672,6 +844,8 @@ fn compare(by: By, dir: Dir, a: &Cand, b: &Cand) -> Ordering {
 struct Sink {
     tx: Sender<Result<Hit>>,
     left: Option<usize>,
+    /// The limit refused a hit.
+    refused: bool,
 }
 
 impl Sink {
@@ -679,13 +853,18 @@ impl Sink {
         Self {
             tx,
             left: limit.map(NonZeroUsize::get),
+            refused: false,
         }
     }
 
     /// False once no more hits are wanted.
     fn send(&mut self, hits: impl IntoIterator<Item = Hit>) -> bool {
         for hit in hits {
-            if self.left == Some(0) || self.tx.send(Ok(hit)).is_err() {
+            if self.left == Some(0) {
+                self.refused = true;
+                return false;
+            }
+            if self.tx.send(Ok(hit)).is_err() {
                 return false;
             }
             self.left = self.left.map(|n| n - 1);
@@ -738,7 +917,8 @@ mod tests {
             key: Key::new(Path::new(name), &md),
             id: (0, 0),
             hit: hit(name),
-            date: None,
+            modified: SystemTime::UNIX_EPOCH,
+            meta: None,
         }
     }
 
@@ -797,6 +977,7 @@ mod tests {
             ocr: None,
             text: text.iter().map(|t| Regex::new(t).unwrap()).collect(),
             show_text: true,
+            describe: false,
             order,
             progress: Arc::default(),
         }
@@ -826,6 +1007,6 @@ mod tests {
     #[test]
     fn empty_matches_show_nothing() {
         let engine = engine(Order::Found, &["x*", "b+"]);
-        assert_eq!(engine.shown("abba".into()), ["bb"]);
+        assert_eq!(engine.matches("abba"), ["bb"]);
     }
 }

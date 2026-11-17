@@ -60,7 +60,7 @@ use self::{
     scatter::Scatter,
 };
 use crate::{
-    output,
+    output, report,
     search::{By, Dir, Field, Hit, Order, Progress, Search},
 };
 
@@ -123,6 +123,7 @@ pub fn run(search: Search, view: View, binds: Vec<Bind>) -> Result<Exit> {
         View::Scatter => "scatter",
         View::Grid => "grid",
     };
+    report::clear();
     // The cause adds nothing: on Linux it is ENXIO from /dev/tty.
     let _stdio = TtyStdio::swap().map_err(|_| anyhow!("{name} mode needs {}", output::TERMINAL))?;
     restore_on_panic();
@@ -400,7 +401,7 @@ impl Core {
             Order::Sorted(Field::Path, _) => "sorting all images by path",
             Order::Found => return,
         };
-        let left = output::time_left(&self.estimate, &self.search.progress);
+        let left = report::time_left(&self.estimate, &self.search.progress.snapshot());
         self.note(frame, &format!("{waiting}{left}"));
     }
 
@@ -723,7 +724,8 @@ impl<B: Board> App<B> {
     }
 
     fn status(&self) -> Line<'static> {
-        let mut spans = vec![Span::raw(format!(" {}  ", self.core.search.status()))];
+        let status = self.core.search.progress.snapshot();
+        let mut spans = vec![Span::raw(format!(" {status}  "))];
         spans.extend(self.ranking.status());
         spans.extend(self.board.status());
         if !self.core.marks.is_empty() {
