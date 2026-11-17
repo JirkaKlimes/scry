@@ -137,7 +137,7 @@ impl Grid {
 }
 
 impl Board for Grid {
-    fn push(&mut self, hit: Hit, _: bool) {
+    fn push(&mut self, hit: Hit) {
         self.hits.push(hit);
     }
 

@@ -317,6 +317,8 @@ fn rank(hits: &[Hit], target: &Target) -> Vec<Hit> {
     let mut ranked: Vec<Hit> = (hits.iter())
         .map(|hit| Hit {
             score: hit.embedding.as_deref().and_then(|e| target.score(e)),
+            // A ranking orders new images like the others.
+            live: false,
             ..hit.clone()
         })
         .collect();

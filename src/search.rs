@@ -114,6 +114,8 @@ pub struct Hit {
     pub matches: Option<Vec<String>>,
     /// With `describe`.
     pub file: Option<FileInfo>,
+    /// --watch found it after the first pass.
+    pub live: bool,
 }
 
 impl Hit {
@@ -125,6 +127,7 @@ impl Hit {
             text: None,
             matches: None,
             file: None,
+            live: false,
         }
     }
 }
@@ -703,7 +706,8 @@ impl Engine {
                     })
                     .collect();
             }
-            let passed = self.read_text(cands);
+            let mut passed = self.read_text(cands);
+            passed.iter_mut().for_each(|c| c.hit.live = true);
             if !self.emit(passed, sink) {
                 break;
             }
