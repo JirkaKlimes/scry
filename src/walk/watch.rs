@@ -146,29 +146,22 @@ impl Follower {
             let wait = next.map_or(Duration::MAX, |at| {
                 at.saturating_duration_since(Instant::now())
             });
-            match events.recv_timeout(wait) {
-                Ok(Ok(event)) if event.need_rescan() => {
-                    // The system dropped events. The engine skips the images that it sent.
-                    for i in 0..self.roots.len() {
-                        let root = self.roots[i].given.clone();
-                        if !self.scan(&root, Path::new("")) {
+            let first = match events.recv_timeout(wait) {
+                Ok(event) => Some(event),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+            // All waiting events first, so the paths of one burst go out once.
+            for event in first.into_iter().chain(events.try_iter()) {
+                match event {
+                    Ok(event) if event.need_rescan() => {
+                        if !self.rescan() {
                             return;
                         }
                     }
+                    Ok(event) => self.note(&event, &mut due),
+                    Err(_) => {}
                 }
-                Ok(Ok(event)) => {
-                    let Some(after) = settle(&event.kind) else {
-                        continue;
-                    };
-                    let at = Instant::now() + after;
-                    for path in &event.paths {
-                        if let Some((root, path)) = self.local(path) {
-                            due.insert(path, (root, at));
-                        }
-                    }
-                }
-                Ok(Err(_)) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
             }
             let now = Instant::now();
             let ready: Vec<_> = due.extract_if(|_, &mut (_, at)| at <= now).collect();
@@ -178,6 +171,24 @@ impl Follower {
                 }
             }
         }
+    }
+
+    fn note(&self, event: &Event, due: &mut HashMap<PathBuf, (usize, Instant)>) {
+        let Some(after) = settle(&event.kind) else {
+            return;
+        };
+        let at = Instant::now() + after;
+        for path in &event.paths {
+            if let Some((root, path)) = self.local(path) {
+                due.insert(path, (root, at));
+            }
+        }
+    }
+
+    /// The system dropped events, so the roots are walked again. The engine skips the images that
+    /// it sent.
+    fn rescan(&self) -> bool {
+        (self.roots.iter()).all(|root| self.scan(&root.given, Path::new("")))
     }
 
     /// The root of an event path, and the path as the walk prints it.
@@ -244,9 +255,7 @@ impl Follower {
 fn settle(kind: &EventKind) -> Option<Duration> {
     match kind {
         EventKind::Access(AccessKind::Close(AccessMode::Write))
-        | EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both)) => {
-            Some(Duration::ZERO)
-        }
+        | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Some(Duration::ZERO),
         EventKind::Create(_)
         | EventKind::Modify(
             ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Other | ModifyKind::Name(_),
