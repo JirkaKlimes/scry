@@ -79,6 +79,7 @@ pub enum Code {
     GpuFallback,
     NoImages,
     NoCache,
+    Unwatched,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -179,11 +180,14 @@ struct Status {
     spinner: Option<ProgressBar>,
     /// The last progress line of `--json`.
     sent: Option<(Snapshot, Instant)>,
+    /// A --watch run gave the notes of its first pass.
+    noted: bool,
 }
 
 static STATUS: Mutex<Status> = Mutex::new(Status {
     spinner: None,
     sent: None,
+    noted: false,
 });
 
 /// Shows how far the search is. JSON gets a line when the progress changes: at most 10 a second,
@@ -191,6 +195,9 @@ static STATUS: Mutex<Status> = Mutex::new(Status {
 pub fn progress(progress: &Progress) {
     let now = progress.snapshot();
     let mut status = STATUS.lock().unwrap();
+    if now.stage == Stage::Watch && !status.noted {
+        watching(&mut status, progress);
+    }
     if json() {
         let skip = status.sent.is_some_and(|(sent, at)| {
             sent == now || sent.stage == now.stage && at.elapsed() < TICK
@@ -202,18 +209,39 @@ pub fn progress(progress: &Progress) {
         let _ = emit(&Event::Progress(now));
         return;
     }
+    if now.stage == Stage::Watch {
+        return;
+    }
     let spinner = status.spinner.get_or_insert_with(|| {
         let spinner = ProgressBar::new_spinner();
         spinner.enable_steady_tick(TICK);
         spinner
     });
-    let text = match now.stage {
-        Stage::Load => "loading the models".into(),
-        Stage::Check => format!("{}/{} checked", now.done, now.total),
-        Stage::Score => format!("{}/{} scored", now.done, now.total),
-        Stage::Text => format!("{}/{} read", now.done, now.total),
-    };
-    spinner.set_message(format!("{text}{}", time_left(spinner, &now)));
+    spinner.set_message(format!("{now}{}", time_left(spinner, &now)));
+}
+
+/// After the first matches, a terminal gets no progress line, but a --watch run still tells when
+/// its first pass ends.
+pub fn watch(progress: &Progress) {
+    let mut status = STATUS.lock().unwrap();
+    if progress.live() && !status.noted {
+        watching(&mut status, progress);
+    }
+}
+
+/// The notes of the first pass. The run ends only when something stops it, so they cannot wait
+/// for the end.
+fn watching(status: &mut Status, progress: &Progress) {
+    status.noted = true;
+    if json() {
+        warnings(progress);
+        return;
+    }
+    if let Some(spinner) = status.spinner.take() {
+        spinner.finish_and_clear();
+    }
+    let notes = file_notes(progress) + "scry: watching for new images\n";
+    let _ = io::stderr().write_all(notes.as_bytes());
 }
 
 /// Removes the progress line, so that the terminal shows a match or the picker instead.
@@ -334,7 +362,36 @@ pub fn warn(code: Code, message: &str) {
             path: None,
         });
     } else {
-        eprintln!("scry: {message}");
+        say(&format!("scry: {message}\n"));
+    }
+}
+
+/// A file that scry cannot read, told at once.
+pub fn unreadable(path: Option<&Path>, reason: &str) {
+    if json() {
+        let _ = emit(&Event::Warning {
+            code: Code::Unreadable,
+            message: reason,
+            path: path.map(PathField::new),
+        });
+    } else {
+        say(&failure(path, reason));
+    }
+}
+
+/// Text on stderr that keeps the progress line whole.
+fn say(text: &str) {
+    match &STATUS.lock().unwrap().spinner {
+        Some(spinner) => spinner.suspend(|| eprint!("{text}")),
+        None => eprint!("{text}"),
+    }
+}
+
+fn failure(path: Option<&Path>, reason: &str) -> String {
+    let reason = clean(reason);
+    match path {
+        Some(path) => format!("scry: cannot read {}: {reason}\n", clean_path(path)),
+        None => format!("scry: {reason}\n"),
     }
 }
 
@@ -355,18 +412,28 @@ pub struct Summary<'a> {
     pub cut: Option<usize>,
 }
 
-/// Tells why images are missing from the output.
+/// Tells why images are missing from the output. A --watch run gave its notes before.
 pub fn end(summary: &Summary) {
+    let noted = STATUS.lock().unwrap().noted;
     if json() {
+        if !noted {
+            warnings(summary.progress);
+            if let Some((message, _)) = no_images(summary) {
+                let _ = emit(&Event::Warning {
+                    code: Code::NoImages,
+                    message: &message,
+                    path: None,
+                });
+            }
+        }
         end_json(summary);
-    } else {
+    } else if !noted {
         // stderr is unbuffered: one write keeps the lines whole next to stdout.
         let _ = io::stderr().write_all(notes(summary).as_bytes());
     }
 }
 
-fn end_json(summary: &Summary) {
-    let progress = summary.progress;
+fn warnings(progress: &Progress) {
     for failure in progress.unreadable.first().iter() {
         let _ = emit(&Event::Warning {
             code: Code::Unreadable,
@@ -377,7 +444,6 @@ fn end_json(summary: &Summary) {
     let warnings = [
         (Code::Unsupported, unsupported(progress)),
         (Code::GpuFallback, gpu_fallback().map(|(e, _)| e)),
-        (Code::NoImages, no_images(summary).map(|(e, _)| e)),
     ];
     for (code, message) in warnings {
         if let Some(message) = message {
@@ -388,6 +454,10 @@ fn end_json(summary: &Summary) {
             });
         }
     }
+}
+
+fn end_json(summary: &Summary) {
+    let progress = summary.progress;
     let _ = emit(&Event::End {
         matched: summary.matched,
         truncated: progress.truncated(),
@@ -403,26 +473,32 @@ fn notes(summary: &Summary) -> String {
     if let Some(cut) = summary.cut.filter(|_| progress.truncated()) {
         notes += &format!("scry: showed the best {cut}. Use -n N or -n all for more.\n");
     }
+    notes += &file_notes(progress);
+    if let Some((message, tip)) = no_images(summary) {
+        notes += &format!("scry: {message}\n");
+        if let Some(tip) = tip {
+            notes += &format!("tip: {tip}\n");
+        }
+    }
+    notes
+}
+
+/// What scry skipped, and how it ran.
+fn file_notes(progress: &Progress) -> String {
+    let mut notes = String::new();
     if let Some(message) = unsupported(progress) {
         notes += &format!("scry: {message}\n");
     }
     let first = progress.unreadable.first();
-    for failure in first.iter() {
-        let reason = clean(&failure.reason);
-        notes += &match &failure.path {
-            Some(path) => format!("scry: cannot read {}: {reason}\n", clean_path(path)),
-            None => format!("scry: {reason}\n"),
-        };
+    for f in first.iter() {
+        notes += &failure(f.path.as_deref(), &f.reason);
     }
     let more = progress.unreadable.count() - first.len();
     if more > 0 {
         notes += &format!("scry: skipped {more} more unreadable {}\n", files(more));
     }
-    for (message, tip) in [gpu_fallback(), no_images(summary)].into_iter().flatten() {
-        notes += &format!("scry: {message}\n");
-        if let Some(tip) = tip {
-            notes += &format!("tip: {tip}\n");
-        }
+    if let Some((message, tip)) = gpu_fallback() {
+        notes += &format!("scry: {message}\ntip: {tip}\n");
     }
     notes
 }
@@ -442,11 +518,11 @@ fn unsupported(progress: &Progress) -> Option<String> {
     })
 }
 
-fn gpu_fallback() -> Option<(String, Option<String>)> {
+fn gpu_fallback() -> Option<(String, &'static str)> {
     let e = embed::gpu::failure()?;
     Some((
         format!("used the CPU, because the GPU failed: {e}"),
-        Some("set SCRY_DEVICE=cpu to skip the GPU.".into()),
+        "set SCRY_DEVICE=cpu to skip the GPU.",
     ))
 }
 

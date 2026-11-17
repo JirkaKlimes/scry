@@ -117,6 +117,8 @@ const HALF_BLOCK_EDGE: border::Set = border::Set {
 
 const HINTS: &str = "asdfghjklqwertyuiopzxcvbnm";
 const FRAME: Duration = Duration::from_millis(33);
+/// How often an idle picker checks for the new images of --watch.
+const LIVE: Duration = Duration::from_millis(250);
 
 pub fn run(search: Search, view: View, binds: Vec<Bind>) -> Result<Exit> {
     let name = match view {
@@ -189,6 +191,10 @@ impl Drop for TtyStdio {
 
 /// True while the picker owns the terminal.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn active() -> bool {
+    ACTIVE.load(Relaxed)
+}
 
 /// Puts the terminal back when a signal stops scry during the picker.
 pub fn restore() {
@@ -395,6 +401,9 @@ impl Core {
     /// A sorted search sends no hit before it has seen all images, so it tells why the screen
     /// is empty.
     fn draw_waiting(&self, frame: &mut Frame) {
+        if self.search.progress.live() {
+            return self.note(frame, "watching for new images");
+        }
         let waiting = match self.search.order {
             Order::Ranked(..) => "scoring all images to show the best first",
             Order::Sorted(Field::Date, _) => "sorting all images by date",
@@ -414,8 +423,8 @@ impl Core {
 /// What scatter and grid mode do in their own way: where the images go and which one is next.
 /// `App` handles the keys that they share.
 trait Board {
-    /// Takes a hit, after the ones before it.
-    fn push(&mut self, hit: Hit);
+    /// Takes a hit, after the ones before it. `new`: --watch found it after the first pass.
+    fn push(&mut self, hit: Hit, new: bool);
 
     /// Drops all hits, before the hits come again in a new order. `order` tells how they come.
     fn clear(&mut self, order: &Order<()>);
@@ -497,8 +506,11 @@ impl<B: Board> App<B> {
             last = now;
             self.core.load_zoom();
             self.draw(terminal)?;
-            // Only a key or a resize can change an idle screen, so wait for one.
-            if (self.idle() || event::poll(FRAME)?)
+            let ready = match self.wait() {
+                Some(wait) => event::poll(wait)?,
+                None => true,
+            };
+            if ready
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
                 && let Break(exit) = self.key(key)
@@ -508,8 +520,20 @@ impl<B: Board> App<B> {
         }
     }
 
+    /// How long to wait for a key before the next frame. Only a key or a resize can change an
+    /// idle screen, so it waits for one, unless --watch can bring new images.
+    fn wait(&self) -> Option<Duration> {
+        if !self.idle() {
+            Some(FRAME)
+        } else if self.core.searching {
+            Some(LIVE)
+        } else {
+            None
+        }
+    }
+
     fn idle(&self) -> bool {
-        !self.core.searching
+        (!self.core.searching || self.core.search.progress.live())
             && !(self.core.zoom.as_ref()).is_some_and(|zoom| zoom.image.pending())
             && self.board.idle()
             && self.ranking.idle()
@@ -524,9 +548,10 @@ impl<B: Board> App<B> {
             ranking,
             ..
         } = self;
+        let new = core.search.progress.live();
         core.drain(|hit| {
             ranking.add(&hit);
-            board.push(hit);
+            board.push(hit, new);
         })
     }
 
@@ -540,7 +565,7 @@ impl<B: Board> App<B> {
                     &self.core.search.order
                 };
                 self.board.clear(order);
-                hits.into_iter().for_each(|hit| self.board.push(hit));
+                hits.into_iter().for_each(|hit| self.board.push(hit, false));
             }
             Ok(None) => {}
             Err(e) => self.fail(&e),
