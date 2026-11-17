@@ -55,6 +55,7 @@ pub fn fetch(asset: &Asset) -> Result<PathBuf> {
     }
     if path.exists() {
         let _ = fs::remove_file(&part);
+        progress.set(asset.size);
     } else {
         progress.note(&format!(
             "downloading the {} ({}) to {}. Later runs use this copy.",
@@ -117,16 +118,18 @@ pub fn cannot_load(path: &Path) -> String {
 fn download(asset: &Asset, file: &mut File, progress: &Download) -> Result<()> {
     let mut hasher = Sha256::new();
     let mut done = copy_hashed(&*file, io::sink(), &mut hasher)?;
+    if done > asset.size {
+        start_over(file)?;
+        (hasher, done) = (Sha256::new(), 0);
+    }
     if done < asset.size {
         let mut resp = (agent().get(asset.url))
             .header("Range", format!("bytes={done}-"))
             .call()
             .context(asset.url)?;
         if resp.status() != StatusCode::PARTIAL_CONTENT {
-            file.set_len(0)?;
-            file.rewind()?;
-            hasher = Sha256::new();
-            done = 0;
+            start_over(file)?;
+            (hasher, done) = (Sha256::new(), 0);
         }
         progress.set(done);
         copy_hashed(
@@ -158,6 +161,11 @@ fn agent() -> ureq::Agent {
         .timeout_per_read(Some(Duration::from_secs(60)))
         .build()
         .into()
+}
+
+fn start_over(file: &mut File) -> io::Result<()> {
+    file.set_len(0)?;
+    file.rewind()
 }
 
 /// Returns the number of bytes.
