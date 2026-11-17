@@ -61,7 +61,7 @@ use self::{
 };
 use crate::{
     output,
-    search::{Hit, Order, Progress, Search},
+    search::{By, Dir, Field, Hit, Order, Progress, Search},
 };
 
 /// How a picker shows the hits.
@@ -395,8 +395,9 @@ impl Core {
     /// is empty.
     fn draw_waiting(&self, frame: &mut Frame) {
         let waiting = match self.search.order {
-            Order::Score(()) => "scoring all images to show the best first",
-            Order::Date(_) => "sorting all images by date",
+            Order::Ranked(..) => "scoring all images to show the best first",
+            Order::Sorted(Field::Date, _) => "sorting all images by date",
+            Order::Sorted(Field::Path, _) => "sorting all images by path",
             Order::Found => return,
         };
         let left = output::time_left(&self.estimate, &self.search.progress);
@@ -533,7 +534,7 @@ impl<B: Board> App<B> {
         match self.ranking.poll() {
             Ok(Some(hits)) => {
                 let order = if self.ranking.probing() {
-                    &Order::Score(())
+                    &Order::Ranked((), By::Score, Dir::Natural)
                 } else {
                     &self.core.search.order
                 };

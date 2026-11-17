@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::{ArgGroup, CommandFactory, Parser, error::ErrorKind};
+use clap::{ArgGroup, CommandFactory, Parser, ValueEnum, error::ErrorKind};
 use ignore::overrides::Override;
 use jiff::civil::DateTime;
 use regex::{Regex, RegexBuilder};
@@ -19,7 +19,7 @@ use crate::{
     meta::{self, MetaFilter, Range},
     output::{self, End, ListOpts, clean_path},
     pick::{Bind, View},
-    search::{DateOrder, Order, Query, Rank, Scoring},
+    search::{By, Dir, Field, Order, Query, Rank, Scoring},
     walk::{self, Source, WalkOpts},
 };
 
@@ -63,7 +63,7 @@ Examples:
   scry -t 'INV-\\d{{4}}' ~/Documents
   scry --grid --date 2024-07 ~/Pictures
   scry --grid --bind 'ctrl-d:cp -- \"$@\" ~/picked/' ~/Pictures
-  scry --order newest -n 1 -t error ~/Pictures/Screenshots",
+  scry --sort date -n 1 -t error ~/Pictures/Screenshots",
         cache = cache::DEFAULT_DIR,
         gpu = embed::gpu::AUTO,
         api = embed::gpu::API,
@@ -174,9 +174,14 @@ struct Args {
     )]
     bind: Vec<Bind>,
 
-    /// Sort by the date that --date uses
-    #[arg(long, value_name = "ORDER", help_heading = "Output")]
-    order: Option<DateOrder>,
+    /// Sort by KEY: score (best first), date (newest first) or path (A to Z). The date is the one
+    /// that --date uses [default: score with -q or -l, else the order scry finds the images]
+    #[arg(long, value_name = "KEY", help_heading = "Output")]
+    sort: Option<SortKey>,
+
+    /// Reverse the order
+    #[arg(short, long, help_heading = "Output")]
+    reverse: bool,
 
     /// Print at most N paths (a number, or all) [default: 20 with -q or -l, unless --min, -s or
     /// --grid]
@@ -200,6 +205,13 @@ struct Args {
     /// Separate paths with NUL instead of newline, on stdin and stdout
     #[arg(short = '0', long, help_heading = "Output")]
     null: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SortKey {
+    Score,
+    Date,
+    Path,
 }
 
 #[derive(Clone, Copy)]
@@ -226,7 +238,7 @@ impl Args {
             _ => None,
         };
         let rank = rank(self.query, self.not, self.like);
-        let order = order(rank, self.order, self.min, view.is_some())?;
+        let order = order(rank, self.sort, self.reverse, self.min, self.limit, view)?;
         let end = if self.null { End::Nul } else { End::Newline };
         let query = Query {
             source: source(self.paths, end),
@@ -297,33 +309,59 @@ fn rank(query: Option<String>, not: Vec<String>, like: Option<PathBuf>) -> Optio
     }
 }
 
-/// `pick` makes the hits carry their embedding, so a picker can rank them again.
+/// A picker makes the hits carry their embedding, so that it can rank them again.
 fn order(
     rank: Option<Rank>,
-    date: Option<DateOrder>,
+    sort: Option<SortKey>,
+    reverse: bool,
     min: Option<f32>,
-    pick: bool,
+    limit: Option<Limit>,
+    view: Option<View>,
 ) -> Result<Order, clap::Error> {
-    match (rank, date) {
-        (Some(rank), None) => {
-            if let Some(min) = min {
-                check_min(&rank, min)?;
-            }
-            Ok(Order::Score(Scoring {
-                rank,
-                min,
-                embeddings: pick,
-            }))
-        }
-        (Some(_), Some(_)) => Err(Args::command().error(
-            ErrorKind::ArgumentConflict,
-            "--order cannot sort the matches of -q or -l\n\n  \
-             tip: choose the matches first, then sort them in a second scry:\n       \
-             scry -q 'a dog' --min 0.01 ~/Pictures | scry --order newest",
-        )),
-        (None, Some(date)) => Ok(Order::Date(date)),
-        (None, None) => Ok(Order::Found),
+    let dir = if reverse { Dir::Reverse } else { Dir::Natural };
+    let Some(rank) = rank else {
+        return match sort {
+            Some(SortKey::Score) => Err(conflict("--sort score needs -q or -l")),
+            Some(SortKey::Date) => Ok(Order::Sorted(Field::Date, dir)),
+            Some(SortKey::Path) => Ok(Order::Sorted(Field::Path, dir)),
+            None if reverse => Err(conflict(
+                "-r reverses the order of --sort, -q or -l\n\n  \
+                 tip: scry always searches subdirectories",
+            )),
+            None => Ok(Order::Found),
+        };
+    };
+    if let Some(min) = min {
+        check_min(&rank, min)?;
     }
+    let flag = rank.flag();
+    let by = match sort {
+        None | Some(SortKey::Score) => By::Score,
+        Some(SortKey::Date) => By::Field(Field::Date),
+        Some(SortKey::Path) => By::Field(Field::Path),
+    };
+    // A list without -n prints the best 20. Pickers and -n all show every image.
+    let counted = match limit {
+        Some(Limit::First(_)) => true,
+        Some(Limit::All) => false,
+        None => view.is_none(),
+    };
+    if by != By::Score && min.is_none() && !counted {
+        return Err(conflict(&format!(
+            "--sort sorts the best matches of {flag}, so it needs a count: -n N or --min SCORE"
+        )));
+    }
+    if matches!(view, Some(View::Scatter)) && by == By::Score && reverse {
+        return Err(conflict(&format!(
+            "scatter mode shows the matches of {flag} in a random order, so -r does nothing"
+        )));
+    }
+    let scoring = Scoring {
+        rank,
+        min,
+        embeddings: view.is_some(),
+    };
+    Ok(Order::Ranked(scoring, by, dir))
 }
 
 fn source(paths: Vec<PathBuf>, end: End) -> Source {
@@ -341,14 +379,17 @@ fn limit_or_default(limit: Option<Limit>, order: &Order, pick: bool) -> Option<N
     match limit {
         Some(Limit::All) => None,
         Some(Limit::First(n)) => Some(n),
-        None => {
-            matches!(order, Order::Score(s) if s.min.is_none() && !pick).then_some(DEFAULT_LIMIT)
-        }
+        None => matches!(order, Order::Ranked(s, ..) if s.min.is_none() && !pick)
+            .then_some(DEFAULT_LIMIT),
     }
 }
 
 fn invalid(msg: &str) -> clap::Error {
     Args::command().error(ErrorKind::ValueValidation, msg)
+}
+
+fn conflict(msg: &str) -> clap::Error {
+    Args::command().error(ErrorKind::ArgumentConflict, msg)
 }
 
 fn limit(s: &str) -> Result<Limit, String> {
@@ -366,10 +407,11 @@ fn camera(re: &str) -> Result<Regex, regex::Error> {
 
 /// A score out of range drops every image, with no hint why.
 fn check_min(rank: &Rank, min: f32) -> Result<(), clap::Error> {
-    let (lo, flag) = match rank {
-        Rank::Text { .. } => (0.0, "-q"),
-        Rank::Like(_) => (-1.0, "-l"),
+    let lo = match rank {
+        Rank::Text { .. } => 0.0,
+        Rank::Like(_) => -1.0,
     };
+    let flag = rank.flag();
     if (lo..=1.0).contains(&min) {
         return Ok(());
     }
@@ -548,7 +590,6 @@ mod tests {
         assert_eq!(err(&["--date", "7d"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["-t", "a[b"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--camera", "("]), ErrorKind::ValueValidation);
-        assert_eq!(err(&["--order", "new"]), ErrorKind::InvalidValue);
         assert_eq!(err(&["-g", "a[b"]), ErrorKind::ValueValidation);
         assert!(parse(&["-q", "cat", "-x", "dog", "-x", "fox", "--min", "0.1"]).is_ok());
         assert!(parse(&["-l", like, "-g", "Screenshots/*"]).is_ok());
@@ -564,29 +605,51 @@ mod tests {
     }
 
     #[test]
-    fn order_is_one_per_run() {
+    fn sort_rules() {
         let file = Temp::file("like.jpg", b"");
         let like = file.to_str().unwrap();
         let order = |args: &[&str]| parse(args).unwrap().0.order;
         assert!(matches!(order(&[]), Order::Found));
         assert!(matches!(order(&["-t", "x"]), Order::Found));
         assert!(matches!(
-            order(&["--order", "newest"]),
-            Order::Date(DateOrder::Newest)
+            order(&["--sort", "date"]),
+            Order::Sorted(Field::Date, Dir::Natural)
         ));
         assert!(matches!(
-            order(&["--order", "oldest", "-s"]),
-            Order::Date(DateOrder::Oldest)
+            order(&["--sort", "path", "-r", "-s"]),
+            Order::Sorted(Field::Path, Dir::Reverse)
         ));
-        assert!(matches!(order(&["-q", "cat"]), Order::Score(_)));
+        assert!(matches!(
+            order(&["-q", "cat"]),
+            Order::Ranked(_, By::Score, Dir::Natural)
+        ));
+        assert!(matches!(
+            order(&["-q", "cat", "-r"]),
+            Order::Ranked(_, By::Score, Dir::Reverse)
+        ));
+        assert!(matches!(
+            order(&["-q", "cat", "--sort", "date"]),
+            Order::Ranked(_, By::Field(Field::Date), Dir::Natural)
+        ));
+        assert!(matches!(
+            order(&["-l", like, "--sort", "path", "--grid", "-n", "9"]),
+            Order::Ranked(_, By::Field(Field::Path), _)
+        ));
+        assert!(parse(&["-q", "cat", "--sort", "date", "--grid", "--min", "0.1"]).is_ok());
+        assert_eq!(err(&["--sort", "score"]), ErrorKind::ArgumentConflict);
+        assert_eq!(err(&["-r"]), ErrorKind::ArgumentConflict);
+        assert_eq!(err(&["-r", "-t", "x"]), ErrorKind::ArgumentConflict);
         assert_eq!(
-            err(&["-q", "cat", "--order", "newest"]),
+            err(&["-q", "cat", "--sort", "date", "-n", "all"]),
             ErrorKind::ArgumentConflict
         );
         assert_eq!(
-            err(&["-l", like, "--order", "oldest"]),
+            err(&["-q", "cat", "--sort", "date", "--grid"]),
             ErrorKind::ArgumentConflict
         );
+        assert_eq!(err(&["-q", "cat", "-s", "-r"]), ErrorKind::ArgumentConflict);
+        assert_eq!(err(&["--sort", "newest"]), ErrorKind::InvalidValue);
+        assert_eq!(err(&["--order", "newest"]), ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -626,7 +689,8 @@ mod tests {
         assert_eq!(limit(&["-q", "cat", "-s"]), None);
         assert_eq!(limit(&["-q", "cat", "--grid"]), None);
         assert_eq!(limit(&["-t", "x"]), None);
-        assert_eq!(limit(&["--order", "newest"]), None);
+        assert_eq!(limit(&["--sort", "date"]), None);
+        assert_eq!(limit(&["-q", "cat", "--sort", "date"]), Some(20));
         assert_eq!(limit(&["-n", "3"]), Some(3));
         assert_eq!(err(&["-n", "0"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["-n", "some"]), ErrorKind::ValueValidation);
@@ -661,7 +725,7 @@ mod tests {
         );
         assert!(matches!(
             q.order,
-            Order::Score(Scoring { rank: Rank::Text { query, not }, min: None, embeddings: false })
+            Order::Ranked(Scoring { rank: Rank::Text { query, not }, min: None, embeddings: false }, ..)
                 if query.as_str() == "receipt" && not.is_empty()
         ));
         assert!(matches!(mode, Mode::List(o) if o.end == End::Nul && o.score && !o.preview));
@@ -677,10 +741,13 @@ mod tests {
         let (q, _) = parse(&["-q", "cat", "-s"]).unwrap();
         assert!(matches!(
             q.order,
-            Order::Score(Scoring {
-                embeddings: true,
+            Order::Ranked(
+                Scoring {
+                    embeddings: true,
+                    ..
+                },
                 ..
-            })
+            )
         ));
         let (q, mode) = parse(&["-q", "cat", "--grid", "--bind", "ctrl-d:rm \"$@\""]).unwrap();
         assert!(matches!(
@@ -689,18 +756,24 @@ mod tests {
         ));
         assert!(matches!(
             q.order,
-            Order::Score(Scoring {
-                embeddings: true,
+            Order::Ranked(
+                Scoring {
+                    embeddings: true,
+                    ..
+                },
                 ..
-            })
+            )
         ));
         let (q, _) = parse(&["-q", "cat"]).unwrap();
         assert!(matches!(
             q.order,
-            Order::Score(Scoring {
-                embeddings: false,
+            Order::Ranked(
+                Scoring {
+                    embeddings: false,
+                    ..
+                },
                 ..
-            })
+            )
         ));
     }
 

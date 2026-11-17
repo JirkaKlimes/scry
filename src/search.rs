@@ -14,7 +14,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::ValueEnum;
 use image::DynamicImage;
 use jiff::civil::DateTime;
 use rayon::prelude::*;
@@ -47,9 +46,30 @@ pub struct Query {
 pub enum Order<S = Scoring> {
     /// The walk order, or the order of the paths on stdin.
     Found,
-    /// Best first.
-    Score(S),
-    Date(DateOrder),
+    Sorted(Field, Dir),
+    /// The best images by score, sorted again by `By`. The limit or the minimum score chooses
+    /// the set.
+    Ranked(S, By, Dir),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Field {
+    Date,
+    Path,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum By {
+    Score,
+    Field(Field),
+}
+
+/// Each key has its natural direction, as in `ls`: score best first, date newest first, path
+/// A to Z.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dir {
+    Natural,
+    Reverse,
 }
 
 pub struct Scoring {
@@ -65,10 +85,14 @@ pub enum Rank {
     Like(PathBuf),
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-pub enum DateOrder {
-    Newest,
-    Oldest,
+impl Rank {
+    /// The option that gives the rank, for messages.
+    pub fn flag(&self) -> &'static str {
+        match self {
+            Rank::Text { .. } => "-q",
+            Rank::Like(_) => "-l",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -148,8 +172,8 @@ impl Search {
     /// Progress for people, like "120/4000 scored".
     pub fn status(&self) -> String {
         let verb = match self.order {
-            Order::Score(()) => "scored",
-            Order::Found | Order::Date(_) => "checked",
+            Order::Ranked(..) => "scored",
+            Order::Found | Order::Sorted(..) => "checked",
         };
         let (done, found) = (&self.progress.done, &self.progress.found);
         format!("{}/{} {verb}", done.load(Relaxed), found.load(Relaxed))
@@ -243,11 +267,11 @@ pub fn run(query: Query) -> Result<Search> {
     crate::stop_on_signals(cache.clone())?;
     let (order, sort) = match query.order {
         Order::Found => (Order::Found, Order::Found),
-        Order::Score(scoring) => (
-            Order::Score(()),
-            Order::Score(Ranker::new(scoring, &cache)?),
+        Order::Sorted(field, dir) => (Order::Sorted(field, dir), Order::Sorted(field, dir)),
+        Order::Ranked(scoring, by, dir) => (
+            Order::Ranked((), by, dir),
+            Order::Ranked(Ranker::new(scoring, &cache)?, by, dir),
         ),
-        Order::Date(date) => (Order::Date(date), Order::Date(date)),
     };
     let ocr = (query.show_text || !query.text.is_empty())
         .then(Ocr::load)
@@ -457,17 +481,26 @@ impl Engine {
                     }
                 }
             }
-            Order::Score(ranker) => {
-                let scored = self.gather(&paths, |chunk| {
-                    self.rank(ranker, self.admit(chunk, false, &mut seen))
-                })?;
-                self.send_sorted(best_first(scored), sink);
-            }
-            Order::Date(order) => {
+            Order::Sorted(field, dir) => {
+                let dated = *field == Field::Date;
                 let mut cands =
-                    self.gather(&paths, |chunk| Ok(self.admit(chunk, true, &mut seen)))?;
-                cands.sort_by(|a, b| by_date(*order, a, b));
+                    self.gather(&paths, |chunk| Ok(self.admit(chunk, dated, &mut seen)))?;
+                cands.sort_by(|a, b| compare(By::Field(*field), *dir, a, b));
                 self.send_sorted(cands, sink);
+            }
+            Order::Ranked(ranker, by, dir) => {
+                let dated = *by == By::Field(Field::Date);
+                let scored = self.gather(&paths, |chunk| {
+                    self.rank(ranker, self.admit(chunk, dated, &mut seen))
+                })?;
+                let best = best_first(scored);
+                if (*by, *dir) == (By::Score, Dir::Natural) {
+                    self.send_sorted(best, sink);
+                } else {
+                    let mut set = self.take(best, sink.left);
+                    set.sort_by(|a, b| compare(*by, *dir, a, b));
+                    sink.send(set.into_iter().map(|c| c.hit));
+                }
             }
         }
         Ok(())
@@ -493,6 +526,19 @@ impl Engine {
             self.progress.done.fetch_add(n, Relaxed);
         }
         Ok(all)
+    }
+
+    /// The first `limit` candidates that pass the text filters. OCR stops there.
+    fn take(&self, cands: Vec<Cand>, limit: Option<usize>) -> Vec<Cand> {
+        let mut set = Vec::new();
+        for chunk in chunks(cands.into_iter(), self.text_chunk()) {
+            set.extend(self.read_text(chunk));
+            if let Some(n) = limit.filter(|&n| set.len() >= n) {
+                set.truncate(n);
+                break;
+            }
+        }
+        set
     }
 
     /// Sends sorted candidates in order, so a limit cuts OCR short.
@@ -609,13 +655,18 @@ fn best_first(mut scored: Vec<(f32, Cand)>) -> Vec<Cand> {
         .collect()
 }
 
-fn by_date(order: DateOrder, a: &Cand, b: &Cand) -> Ordering {
-    let oldest = a.date.cmp(&b.date);
-    let first = match order {
-        DateOrder::Oldest => oldest,
-        DateOrder::Newest => oldest.reverse(),
+fn compare(by: By, dir: Dir, a: &Cand, b: &Cand) -> Ordering {
+    let score = |c: &Cand| c.hit.score.unwrap_or(f32::NEG_INFINITY);
+    let natural = match by {
+        By::Score => score(b).total_cmp(&score(a)),
+        By::Field(Field::Date) => b.date.cmp(&a.date),
+        By::Field(Field::Path) => a.hit.path.cmp(&b.hit.path),
     };
-    first.then_with(|| a.hit.path.cmp(&b.hit.path))
+    let order = match dir {
+        Dir::Natural => natural,
+        Dir::Reverse => natural.reverse(),
+    };
+    order.then_with(|| a.hit.path.cmp(&b.hit.path))
 }
 
 struct Sink {
@@ -765,7 +816,7 @@ mod tests {
         drop(tx);
         let (hits, got) = mpsc::channel();
         let mut sink = Sink::new(hits, None);
-        let engine = engine(Order::Date(DateOrder::Oldest), &[]);
+        let engine = engine(Order::Sorted(Field::Path, Dir::Natural), &[]);
         engine.run(rx, &mut sink).unwrap();
         drop(sink);
         let names: Vec<PathBuf> = got.iter().map(|h| h.unwrap().path).collect();
