@@ -242,8 +242,10 @@ impl Progress {
     fn fail(&self, path: Option<&Path>, reason: &dyn fmt::Display) {
         if self.tells() {
             report::unreadable(path, &format!("{reason:#}"));
+            self.unreadable.tally();
+        } else {
+            self.unreadable.add(path, reason);
         }
-        self.unreadable.add(path, reason);
     }
 
     /// An image in a format that scry cannot read.
@@ -292,6 +294,11 @@ impl Unreadable {
                 reason: format!("{reason:#}"),
             });
         }
+    }
+
+    /// Counts a failure that went out at once, so the notes do not tell it again.
+    fn tally(&self) {
+        self.count.fetch_add(1, Relaxed);
     }
 
     pub fn count(&self) -> usize {
