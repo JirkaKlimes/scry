@@ -245,11 +245,7 @@ impl Progress {
     /// An image in a format that scry cannot read.
     fn skip(&self, path: &Path) {
         if self.tells() {
-            let message = format!(
-                "skipped {}: scry cannot read this format yet",
-                clean_path(path)
-            );
-            report::warn(report::Code::Unsupported, &message);
+            report::unsupported(path);
         }
         self.unsupported.fetch_add(1, Relaxed);
     }
