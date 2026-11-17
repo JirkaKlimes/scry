@@ -368,8 +368,9 @@ impl Board for Scatter {
         Ok(Continue(()))
     }
 
+    /// Also with nothing left to land, while --watch waits for new images.
     fn idle(&self) -> bool {
-        self.paused()
+        self.paused() || self.feed.is_empty() && self.queue.is_empty() && self.layout.ahead() == 0
     }
 
     fn key(&mut self, core: &mut Core, code: KeyCode) {
