@@ -71,7 +71,8 @@ Examples:
     )
 )]
 struct Args {
-    /// Files or directories [default: paths on stdin if it is a pipe or a file, else .]
+    /// Files or directories, or - for a list of paths on stdin [default: the list on stdin if it
+    /// is a pipe or a file, else .]
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
 
@@ -366,13 +367,19 @@ fn order(
 }
 
 fn source(paths: Vec<PathBuf>, end: End) -> Source {
-    if !paths.is_empty() {
-        Source::Paths(paths)
-    } else if stdin_piped() {
-        Source::Stdin(end)
-    } else {
-        Source::Paths(vec![".".into()])
+    let (dash, mut paths): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| is_stdin(p));
+    let stdin = !dash.is_empty() || paths.is_empty() && stdin_piped();
+    if paths.is_empty() && !stdin {
+        paths.push(".".into());
     }
+    Source {
+        paths,
+        stdin: stdin.then_some(end),
+    }
+}
+
+fn is_stdin(path: &Path) -> bool {
+    path.as_os_str() == "-"
 }
 
 /// A ranked search prints the best few, unless it has a cutoff or you pick by eye.
@@ -425,8 +432,8 @@ fn check_min(rank: &Rank, min: f32) -> Result<(), clap::Error> {
 /// People who know grep type the query as the first argument. When the missing paths look like
 /// words, the error shows the command they meant.
 fn check_paths(paths: &[PathBuf], query: Option<&str>) -> Result<(), clap::Error> {
-    let missing: Vec<&PathBuf> = paths
-        .iter()
+    let missing: Vec<&PathBuf> = (paths.iter())
+        .filter(|p| !is_stdin(p))
         .filter(|p| fs::metadata(p).is_err_and(|e| e.kind() == io::ErrorKind::NotFound))
         .collect();
     let Some(first) = missing.first() else {
@@ -723,7 +730,8 @@ mod tests {
         assert!(q.meta.needs_meta());
         assert!(q.walk.globs.matched("x/a.PNG", false).is_ignore());
         assert!(
-            matches!(q.source, Source::Paths(p) if p == [PathBuf::from("src"), "Cargo.toml".into()])
+            q.source.paths == [PathBuf::from("src"), "Cargo.toml".into()]
+                && q.source.stdin.is_none()
         );
         assert!(matches!(
             q.order,
@@ -777,6 +785,19 @@ mod tests {
                 ..
             )
         ));
+    }
+
+    #[test]
+    fn dash_reads_stdin() {
+        let source = |args: &[&str]| parse(args).unwrap().0.source;
+        let s = source(&["-", "src"]);
+        assert_eq!(
+            (s.paths, s.stdin),
+            (vec![PathBuf::from("src")], Some(End::Newline))
+        );
+        let s = source(&["-0", "-"]);
+        assert_eq!((s.paths, s.stdin), (vec![], Some(End::Nul)));
+        assert!(source(&["src"]).stdin.is_none());
     }
 
     #[test]
