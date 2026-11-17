@@ -189,8 +189,10 @@ fn calendar(s: &str, tz: &TimeZone) -> Option<Bound<DateTime>> {
         secs
     })
     .ok()?;
-    let local = |t| Some(tz.to_datetime(offset.to_timestamp(t).ok()?));
-    Some(Bound::Period(local(start)?, local(end)?))
+    // The period keeps its length. Its end in local time can repeat its start, when the clocks
+    // go back.
+    let start = tz.to_datetime(offset.to_timestamp(start).ok()?);
+    Some(Bound::Period(start, start.checked_add(unit).ok()?))
 }
 
 #[derive(Default)]
