@@ -31,6 +31,7 @@ regex-syntax = "0.8.11"
 rten = "0.26"
 rustix = { version = "1.1.6", features = ["event", "fs", "stdio", "termios"] }
 sha2 = "0.11.1"
+signal-hook = "0.3.18"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 tract = { version = "=0.23.10", default-features = false, features = ["onnx", "wgpu"] }
 ureq = "3.5.1"

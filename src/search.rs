@@ -205,6 +205,7 @@ pub fn run(query: Query) -> Result<Search> {
     let walk = walk::candidates(query.source, query.walk)?;
     let paths = counted(walk.found, progress.clone());
     let cache = Arc::new(Cache::open()?);
+    crate::stop_on_signals(cache.clone())?;
     let (order, sort) = match query.order {
         Order::Found => (Order::Found, Order::Found),
         Order::Score(scoring) => (
