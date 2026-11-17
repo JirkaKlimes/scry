@@ -56,15 +56,16 @@ Environment:
                gpu: any GPU, also an integrated one. An error if there is none
                cpu: only the CPU
 
-Exit status: 0 if scry printed a path, else 1. 2 on error. 130 if you quit scatter or grid \
-mode. Files that scry cannot read do not change it.
+Exit status: 0 if scry printed a path, else 1, and with --json 0 if the run ends. 2 on error. 130 \
+if you quit scatter or grid mode. Files that scry cannot read do not change it.
 
 Examples:
   scry -q 'a dog in the snow' ~/Pictures
   scry -t 'INV-\\d{{4}}' ~/Documents
   scry --grid --date 2024-07 ~/Pictures
   scry --grid --bind 'ctrl-d:cp -- \"$@\" ~/picked/' ~/Pictures
-  scry --sort date -n 1 -t error ~/Pictures/Screenshots",
+  scry --sort date -n 1 -t error ~/Pictures/Screenshots
+  scry --watch=new -t error ~/Pictures/Screenshots",
         cache = cache::DEFAULT_DIR,
         gpu = embed::gpu::AUTO,
         api = embed::gpu::API,
@@ -190,17 +191,17 @@ struct Args {
     )]
     bind: Vec<Bind>,
 
-    /// Sort by KEY: score (best first), date (newest first) or path (A to Z). The date is the one
-    /// that --date uses [default: score with -q or -l, else the order scry finds the images]
-    #[arg(long, value_name = "KEY", help_heading = "Output")]
+    /// Sort by KEY: score (best first), date (newest first) or path (A to Z) [default: score with -q
+    /// or -l, else the order scry finds the images]
+    #[arg(long, value_name = "KEY", hide_possible_values = true, help_heading = "Output")]
     sort: Option<SortKey>,
 
     /// Reverse the order
     #[arg(short, long, help_heading = "Output")]
     reverse: bool,
 
-    /// Print at most N paths (a number, or all) [default: 20 with -q or -l, unless --min, -s or
-    /// --grid]
+    /// Print at most N paths (a number, or all) [default: 20 with -q or -l, unless --min, -s,
+    /// --grid or --watch]
     #[arg(short = 'n', long, value_name = "N", value_parser = limit, help_heading = "Output")]
     limit: Option<Limit>,
 
