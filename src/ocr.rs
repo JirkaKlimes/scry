@@ -28,6 +28,7 @@ const DETECTION: Asset = Asset {
     name: name!(detection),
     url: "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx",
     sha256: "a917b23dbd9524b465df7e922641b3ff2981623df4ded5a0234004ef2fee7cfe",
+    size: 2_499_479,
 };
 
 const RECOGNITION: Asset = Asset {
@@ -35,6 +36,7 @@ const RECOGNITION: Asset = Asset {
     name: name!(recognition),
     url: "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx",
     sha256: "86c145c2edb96c8caed5b1ebb8f44d706408922211451c309c625157dd6061c5",
+    size: 9_713_177,
 };
 
 /// Recognition cuts each text line from this copy, so a larger copy reads smaller text. It also

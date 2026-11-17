@@ -44,18 +44,21 @@ const VISION: Asset = Asset {
     name: "siglip2-base-224-ba1f3b08-vision-fp16.onnx",
     url: hf!("onnx/vision_model_fp16.onnx"),
     sha256: "a1959f7bd3993a607e48839f6d01e25b876fe76afda301b028b78eef68aabd95",
+    size: 186_039_516,
 };
 const TEXT: Asset = Asset {
     label: "SigLIP 2 text model",
     name: "siglip2-base-224-ba1f3b08-text-int8.onnx",
     url: hf!("onnx/text_model_int8.onnx"),
     sha256: "3a0603d3a00c05a80a6ded4743c16aaac7b1e62cdcc7e362e7ce418659b96400",
+    size: 283_438_275,
 };
 const TOKENIZER: Asset = Asset {
     label: "SigLIP 2 tokenizer",
     name: "siglip2-base-224-ba1f3b08-tokenizer.json",
     url: hf!("tokenizer.json"),
     sha256: "cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
+    size: 34_363_039,
 };
 
 // exp(logit_scale) and logit_bias of google/siglip2-base-patch16-224 at revision 75de2d55.
