@@ -378,6 +378,20 @@ pub fn unreadable(path: Option<&Path>, reason: &str) {
     }
 }
 
+/// A new image in a format that scry cannot read, told at once.
+pub fn unsupported(path: &Path) {
+    let message = "scry cannot read this format yet";
+    if json() {
+        let _ = emit(&Event::Warning {
+            code: Code::Unsupported,
+            message,
+            path: Some(PathField::new(path)),
+        });
+    } else {
+        say(&format!("scry: skipped {}: {message}\n", clean_path(path)));
+    }
+}
+
 /// Text on stderr that keeps the progress line whole.
 fn say(text: &str) {
     match &STATUS.lock().unwrap().spinner {
@@ -442,7 +456,7 @@ fn warnings(progress: &Progress) {
         });
     }
     let warnings = [
-        (Code::Unsupported, unsupported(progress)),
+        (Code::Unsupported, unsupported_note(progress)),
         (Code::GpuFallback, gpu_fallback().map(|(e, _)| e)),
     ];
     for (code, message) in warnings {
@@ -486,7 +500,7 @@ fn notes(summary: &Summary) -> String {
 /// What scry skipped, and how it ran.
 fn file_notes(progress: &Progress) -> String {
     let mut notes = String::new();
-    if let Some(message) = unsupported(progress) {
+    if let Some(message) = unsupported_note(progress) {
         notes += &format!("scry: {message}\n");
     }
     let first = progress.unreadable.first();
@@ -507,7 +521,7 @@ fn files(n: usize) -> &'static str {
     if n == 1 { "file" } else { "files" }
 }
 
-fn unsupported(progress: &Progress) -> Option<String> {
+fn unsupported_note(progress: &Progress) -> Option<String> {
     let n = progress.unsupported();
     (n > 0).then(|| {
         format!(
