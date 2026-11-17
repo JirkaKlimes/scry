@@ -38,6 +38,9 @@ pub enum Watch {
 /// A writer that does not close its file, or a system that does not tell, gets this much quiet
 /// before scry reads the file.
 const SETTLE: Duration = Duration::from_millis(500);
+/// On Linux, a writer that closes the file tells so. A write waits for that, but not longer than
+/// this, for a writer that keeps the file open.
+const WRITING: Duration = Duration::from_secs(10);
 
 /// Watches each directory that the walk enters. On macOS a watch covers the whole tree below
 /// it, so only the roots get one.
@@ -299,6 +302,9 @@ fn settle(kind: &EventKind) -> Option<Duration> {
     match kind {
         EventKind::Access(AccessKind::Close(AccessMode::Write))
         | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Some(Duration::ZERO),
+        EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_)) if cfg!(target_os = "linux") => {
+            Some(WRITING)
+        }
         EventKind::Create(_)
         | EventKind::Modify(
             ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Other | ModifyKind::Name(_),
