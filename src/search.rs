@@ -139,10 +139,7 @@ pub struct FileInfo {
 impl FileInfo {
     /// The date that --date and --sort date use.
     pub fn date(&self) -> Option<DateTime> {
-        match &self.meta {
-            Some(meta) => meta.date(self.modified),
-            None => meta::local(self.modified),
-        }
+        meta::date_of(self.meta.as_ref(), self.modified)
     }
 }
 
@@ -607,7 +604,7 @@ struct Cand {
 
 impl Cand {
     fn date(&self) -> Option<DateTime> {
-        self.meta.as_ref()?.date(self.modified)
+        meta::date_of(self.meta.as_ref(), self.modified)
     }
 }
 
@@ -843,13 +840,18 @@ impl Engine {
         decode::check(md)?;
         let key = Key::new(path, md);
         let modified = md.modified()?;
-        let mut meta = None;
-        if dated || self.filter.needs_meta() {
-            let read = view.meta(&key, || meta::read(path))?;
-            if !self.filter.check(&read, modified) {
-                return Ok(None);
-            }
-            meta = Some(read);
+        let filtered = self.filter.needs_meta();
+        let meta = match (dated || filtered).then(|| view.meta(&key, || meta::read(path))) {
+            None => None,
+            Some(Ok(read)) => Some(read),
+            // A sort by date takes the time the file changed, as the output does.
+            Some(Err(_)) if !filtered => None,
+            Some(Err(e)) => return Err(e),
+        };
+        if let Some(read) = &meta
+            && !self.filter.check(read, modified)
+        {
+            return Ok(None);
         }
         Ok(Some(Cand {
             key,

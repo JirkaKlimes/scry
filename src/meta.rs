@@ -18,17 +18,17 @@ pub struct Meta {
     pub exif: Exif,
 }
 
-impl Meta {
-    /// When the photo was taken, else when the file last changed. Phone galleries do the same, so
-    /// screenshots and downloads get a date too.
-    pub fn date(&self, modified: SystemTime) -> Option<DateTime> {
-        (self.exif.taken).or_else(|| local(modified))
-    }
+/// The date that --date and --sort date use: when the photo was taken, else when the file last
+/// changed. Phone galleries do the same, so screenshots and downloads get a date too.
+pub fn date_of(meta: Option<&Meta>, modified: SystemTime) -> Option<DateTime> {
+    (meta.and_then(|m| m.exif.taken)).or_else(|| local(modified))
 }
 
-/// Wall-clock time in the local time zone.
-pub fn local(time: SystemTime) -> Option<DateTime> {
-    Some(Zoned::try_from(time).ok()?.datetime())
+/// Wall-clock time in the local time zone, to the second, as in EXIF and in the output. Files
+/// with the same second then sort by path.
+fn local(time: SystemTime) -> Option<DateTime> {
+    let time = Zoned::try_from(time).ok()?.datetime();
+    time.with().subsec_nanosecond(0).build().ok()
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -216,7 +216,7 @@ impl MetaFilter {
     pub fn check(&self, meta: &Meta, modified: SystemTime) -> bool {
         within(&self.width, || Some(meta.width))
             && within(&self.height, || Some(meta.height))
-            && within(&self.date, || meta.date(modified))
+            && within(&self.date, || date_of(Some(meta), modified))
             && self
                 .camera
                 .as_ref()
@@ -551,7 +551,15 @@ mod tests {
         assert!(summer.check(&meta(Exif::default()), july));
         assert!(summer.check(&meta(taken(dt(2024, 8, 31))), local(noon(2020, 1, 1))));
         assert!(!summer.check(&meta(taken(dt(2024, 9, 1))), july));
-        assert_eq!(meta(Exif::default()).date(july), Some(noon(2024, 7, 10)));
+        let plain = meta(Exif::default());
+        assert_eq!(date_of(Some(&plain), july), Some(noon(2024, 7, 10)));
+        assert_eq!(date_of(None, july), Some(noon(2024, 7, 10)));
+        let late = july + std::time::Duration::from_millis(900);
+        assert_eq!(
+            date_of(None, late),
+            Some(noon(2024, 7, 10)),
+            "whole seconds"
+        );
     }
 
     fn ascii(tag: Tag, s: &str) -> Field {
