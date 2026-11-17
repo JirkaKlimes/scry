@@ -210,13 +210,17 @@ impl Progress {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let stage = match self.stage.load(Relaxed) {
-            1 => Stage::Load,
-            2 => Stage::Score,
-            3 => Stage::Text,
-            4 => Stage::Watch,
-            _ => Stage::Check,
-        };
+        let raw = self.stage.load(Relaxed);
+        let stages = [
+            Stage::Check,
+            Stage::Load,
+            Stage::Score,
+            Stage::Text,
+            Stage::Watch,
+        ];
+        let stage = (stages.into_iter())
+            .find(|&stage| stage as u8 == raw)
+            .expect("only `enter` stores a stage");
         let listed = self.listed.load(Relaxed);
         let total = match stage {
             Stage::Text => listed,
