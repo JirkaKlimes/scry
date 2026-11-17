@@ -77,7 +77,7 @@ struct Args {
     paths: Vec<PathBuf>,
 
     /// Rank by how well TEXT describes the image, in any language
-    #[arg(short, long, value_name = "TEXT", help_heading = "Meaning")]
+    #[arg(short, long, value_name = "TEXT", value_parser = words, help_heading = "Meaning")]
     query: Option<String>,
 
     /// Rank by how similar the image looks to IMAGE
@@ -89,6 +89,7 @@ struct Args {
         short = 'x',
         long = "not",
         value_name = "TEXT",
+        value_parser = words,
         requires = "query",
         conflicts_with = "like",
         help_heading = "Meaning"
@@ -446,6 +447,14 @@ fn conflict(msg: &str) -> clap::Error {
     Args::command().error(ErrorKind::ArgumentConflict, msg)
 }
 
+/// An empty text ranks by nothing, with no hint why.
+fn words(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("the text is empty".into());
+    }
+    Ok(s.into())
+}
+
 fn limit(s: &str) -> Result<Limit, String> {
     if s == "all" {
         return Ok(Limit::All);
@@ -640,6 +649,8 @@ mod tests {
             err(&["--grid", "-S", "-q", "cat"]),
             ErrorKind::ArgumentConflict
         );
+        assert_eq!(err(&["-q", " "]), ErrorKind::ValueValidation);
+        assert_eq!(err(&["-q", "cat", "-x", ""]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--width", "big"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--date", "7"]), ErrorKind::ValueValidation);
         assert!(parse(&["--date", "7d"]).is_ok());
