@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use half::f16;
 use redb::{
     ConcurrencyMode, Database, DatabaseError, ReadOnlyTable, ReadTransaction, ReadableDatabase,
@@ -123,8 +123,14 @@ impl Cache {
     /// Without a cache the search is slower, and scatter mode cannot spread out look-alikes.
     /// Neither is an error, but a bad SCRY_CACHE is.
     pub fn open() -> Result<Self> {
-        let dir = location(env::var_os("SCRY_CACHE"))?;
-        let db = create(&dir).and_then(|()| {
+        let var = env::var_os("SCRY_CACHE").filter(|v| !v.is_empty());
+        let given = var.is_some();
+        let dir = location(var)?;
+        let created = create(&dir);
+        if let (true, Err(e)) = (given, &created) {
+            bail!("cannot use SCRY_CACHE: {e:#}");
+        }
+        let db = created.and_then(|()| {
             let path = dir.join(format!("cache-v{VERSION}.redb"));
             open_or_replace(&path).with_context(|| clean_path(&path).to_string())
         });
