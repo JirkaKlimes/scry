@@ -29,7 +29,7 @@ use super::{
     Board, Core, Exit, Graphics, HINTS, Outcome, Step, draw_check, draw_hint, prefetch::Shape,
     protocol,
 };
-use crate::search::{Hit, Order};
+use crate::search::{By, Hit, Order};
 
 const INTERVAL: Duration = Duration::from_millis(200);
 const MIN_INTERVAL: Duration = Duration::from_millis(50);
@@ -109,8 +109,8 @@ impl Scatter {
     pub fn new(order: &Order<()>) -> Self {
         Self {
             feed: match order {
-                Order::Date(_) => Feed::in_order(),
-                Order::Found | Order::Score(()) => Feed::shuffled(),
+                Order::Sorted(..) | Order::Ranked(_, By::Field(_), _) => Feed::in_order(),
+                Order::Found | Order::Ranked(_, By::Score, _) => Feed::shuffled(),
             },
             queue: Queue::default(),
             shown: Scene::default(),
