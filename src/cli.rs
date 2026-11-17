@@ -230,13 +230,14 @@ pub fn parse() -> Result<(Query, Mode), clap::Error> {
     Args::try_parse()?.split()
 }
 
-/// The message of a usage error, without the usage block that clap adds. clap also tells to put
-/// a value that starts with - after `--`, but scry reads the arguments after `--` as paths.
+/// The message of a usage error, without the usage and help hints that clap adds. clap also
+/// tells to put a value that starts with - after `--`, but scry reads the arguments after `--` as
+/// paths.
 pub fn message(e: &clap::Error) -> String {
     let text = e.to_string();
     let text = text.strip_prefix("error: ").unwrap_or(&text);
     (text.split("\n\n"))
-        .take_while(|part| !part.starts_with("Usage:"))
+        .take_while(|part| !part.starts_with("Usage:") && !part.starts_with("For more information"))
         .filter(|part| !part.starts_with("  tip: to pass '"))
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -861,6 +862,11 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(message(&e), "unexpected argument '--order' found");
+        let e = Args::try_parse_from(["scry", "-n", "0"]).err().unwrap();
+        assert_eq!(
+            message(&e),
+            "invalid value '0' for '--limit <N>': expected a number from 1 up, or all"
+        );
         let e = Args::try_parse_from(["scry", "--hiden"]).err().unwrap();
         assert_eq!(
             message(&e),
