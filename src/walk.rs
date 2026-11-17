@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result};
@@ -95,11 +96,19 @@ pub fn candidates(source: Source, opts: WalkOpts, watch: Option<Watch>) -> Resul
         }
     }
     let (watcher, live) = match watch {
-        Some(_) => {
+        Some(mode) => {
+            let since = SystemTime::now();
             let (watcher, events) = watch::Dirs::new()?;
             dirs.iter().for_each(|dir| watcher.root(dir));
             let (tx, live) = mpsc::channel();
-            watch::follow(events, &dirs, opts.clone(), watcher.clone(), tx)?;
+            let follow = watch::Follow {
+                roots: &dirs,
+                opts: opts.clone(),
+                dirs: watcher.clone(),
+                since,
+                mode,
+            };
+            follow.start(events, tx)?;
             (Some(watcher), Some(live))
         }
         None => (None, None),

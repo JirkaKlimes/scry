@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     env, fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -10,7 +11,7 @@ use std::{
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -100,40 +101,50 @@ struct Root {
     matcher: IncrementalIgnore,
 }
 
-/// Turns events into the paths of images that are ready to read, and sends them in the form
-/// the walk prints.
-pub fn follow(
-    events: Receiver<notify::Result<Event>>,
-    roots: &[PathBuf],
-    opts: WalkOpts,
-    dirs: Dirs,
-    tx: Sender<Found>,
-) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let roots = (roots.iter())
-        .map(|root| Root {
-            given: root.clone(),
-            absolute: cwd.join(root),
-            canonical: fs::canonicalize(root).ok(),
-            matcher: builder(root, Path::new(""), &opts, None)
-                .build_matchers()
-                .remove(0),
-        })
-        .collect();
-    let mut follower = Follower {
-        roots,
-        opts,
-        dirs,
-        tx,
-    };
-    thread::spawn(move || follower.run(&events));
-    Ok(())
+/// What the follower of the events needs.
+pub struct Follow<'a> {
+    pub roots: &'a [PathBuf],
+    pub opts: WalkOpts,
+    pub dirs: Dirs,
+    /// When the watches went up.
+    pub since: SystemTime,
+    pub mode: Watch,
+}
+
+impl Follow<'_> {
+    /// Turns events into the paths of images that are ready to read, and sends them in the form
+    /// the walk prints.
+    pub fn start(self, events: Receiver<notify::Result<Event>>, tx: Sender<Found>) -> Result<()> {
+        let cwd = env::current_dir()?;
+        let roots = (self.roots.iter())
+            .map(|root| Root {
+                given: root.clone(),
+                absolute: cwd.join(root),
+                canonical: fs::canonicalize(root).ok(),
+                matcher: builder(root, Path::new(""), &self.opts, None)
+                    .build_matchers()
+                    .remove(0),
+            })
+            .collect();
+        let mut follower = Follower {
+            roots,
+            opts: self.opts,
+            dirs: self.dirs,
+            since: self.since,
+            mode: self.mode,
+            tx,
+        };
+        thread::spawn(move || follower.run(&events));
+        Ok(())
+    }
 }
 
 struct Follower {
     roots: Vec<Root>,
     opts: WalkOpts,
     dirs: Dirs,
+    since: SystemTime,
+    mode: Watch,
     tx: Sender<Found>,
 }
 
@@ -185,10 +196,10 @@ impl Follower {
         }
     }
 
-    /// The system dropped events, so the roots are walked again. The engine skips the images that
-    /// it sent.
+    /// The system dropped events, so the roots are walked again for the files that changed since
+    /// the watches went up. The engine skips the images that it sent.
     fn rescan(&self) -> bool {
-        (self.roots.iter()).all(|root| self.scan(&root.given, Path::new("")))
+        (self.roots.iter()).all(|root| self.scan(&root.given, Path::new(""), true))
     }
 
     /// The root of an event path, and the path as the walk prints it.
@@ -220,12 +231,16 @@ impl Follower {
             return true;
         }
         if md.is_dir() {
-            // Watch first, so the scan sees each file that comes before the watch.
+            // Watch first, so the scan sees each file that comes before the watch. A directory
+            // that moves in keeps the change times of its files, so they all count.
             self.dirs.add(path);
-            return self.scan(path, &below);
+            return self.scan(path, &below, false);
         }
         // An empty file is a placeholder that a writer fills later.
         if !md.is_file() || md.len() == 0 {
+            return true;
+        }
+        if self.mode == Watch::New && !changed_since(&md, self.since) {
             return true;
         }
         Found::new(path).is_none_or(|found| self.tx.send(found).is_ok())
@@ -243,11 +258,29 @@ impl Follower {
     }
 
     /// Walks a directory that came after the walk, or a root again.
-    fn scan(&self, dir: &Path, below: &Path) -> bool {
+    /// `changed`: only the files that changed since the watches went up.
+    fn scan(&self, dir: &Path, below: &Path, changed: bool) -> bool {
         let walk = builder(dir, below, &self.opts, Some(&self.dirs)).build();
-        walk.filter_map(entry)
+        (walk.filter_map(entry))
+            .filter(|found| !changed || self.changed(found))
             .all(|found| self.tx.send(found).is_ok())
     }
+
+    fn changed(&self, found: &Found) -> bool {
+        match found {
+            Found::Image(path) | Found::Unsupported(path) => {
+                fs::metadata(path).is_ok_and(|md| changed_since(&md, self.since))
+            }
+            Found::Error { .. } => false,
+        }
+    }
+}
+
+/// A write, a rename or a link moves the change time. An open with no write leaves it.
+fn changed_since(md: &fs::Metadata, since: SystemTime) -> bool {
+    let changed = u64::try_from(md.ctime())
+        .map(|secs| UNIX_EPOCH + Duration::new(secs, md.ctime_nsec() as u32));
+    changed.is_ok_and(|changed| changed >= since)
 }
 
 /// How long a path waits before scry reads it. A writer that closes the file, or a rename into
