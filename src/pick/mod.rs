@@ -442,8 +442,8 @@ impl Core {
 /// What scatter and grid mode do in their own way: where the images go and which one is next.
 /// `App` handles the keys that they share.
 trait Board {
-    /// Takes a hit, after the ones before it. `new`: --watch found it after the first pass.
-    fn push(&mut self, hit: Hit, new: bool);
+    /// Takes a hit, after the ones before it.
+    fn push(&mut self, hit: Hit);
 
     /// Drops all hits, before the hits come again in a new order. `order` tells how they come.
     fn clear(&mut self, order: &Order<()>);
@@ -567,10 +567,9 @@ impl<B: Board> App<B> {
             ranking,
             ..
         } = self;
-        let new = core.search.progress.live();
         core.drain(|hit| {
             ranking.add(&hit);
-            board.push(hit, new);
+            board.push(hit);
         })
     }
 
@@ -584,7 +583,7 @@ impl<B: Board> App<B> {
                     &self.core.search.order
                 };
                 self.board.clear(order);
-                hits.into_iter().for_each(|hit| self.board.push(hit, false));
+                hits.into_iter().for_each(|hit| self.board.push(hit));
             }
             Ok(None) => {}
             Err(e) => self.fail(&e),

@@ -328,8 +328,8 @@ impl Scatter {
 }
 
 impl Board for Scatter {
-    fn push(&mut self, hit: Hit, new: bool) {
-        if new {
+    fn push(&mut self, hit: Hit) {
+        if hit.live {
             self.feed.push_new(hit);
         } else {
             self.feed.push(hit);
