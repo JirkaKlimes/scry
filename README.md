@@ -75,7 +75,7 @@ fd -0 -e jpg . ~/Pictures | scry -0 -t invoice | xargs -0 -I{} cp {} ~/invoices
 
 `scry --help` shows all options.
 
-`--watch` searches the directories as usual, then keeps watching them and searches each new image the same way. `--watch=new` shows only the new images. With `-q` or `-l` it needs `--min`: a new image goes out when its score is high enough.
+`--watch` searches the directories as usual, then keeps watching them and searches each new image the same way. `--watch=new` shows only the new images. An image that changes after the start also counts as new. With `-q` or `-l` it needs `--min`: a new image goes out when its score is high enough.
 
 ## Pick by eye
 
@@ -119,7 +119,7 @@ kitty, Ghostty, iTerm2, WezTerm, foot and other terminals with sixel support sho
 | `download` | `label`, `done`, `total` in bytes, while a model downloads |
 | `progress` | `stage` (`load`, `check`, `score`, `text`, `watch`), `done`, `total`, `walking` |
 | `match` | `path`, `score` with `-q` or `-l`, `date`, `taken`, `modified`, `width`, `height`, `camera`, `gps`, `matches` with `-t`, `text` with `-o` |
-| `warning` | `code`, `message`, `path` for a file that scry cannot read |
+| `warning` | `code` (`unreadable`, `unsupported`, `no_images`, `gpu_fallback`, `no_cache`, `unwatched`), `message`, `path` for a file |
 | `end` | `matched`, `truncated`, `found`, `unsupported`, `unreadable` |
 | `error` | `code` (`usage`, `download`, `other`), `message` |
 
@@ -131,7 +131,7 @@ scry --json -n 1 -q "a red car" ~/Pictures
 {"type":"end","matched":1,"truncated":true,"found":1311,"unsupported":0,"unreadable":0}
 ```
 
-Each run ends with one `end` or one `error` line, and the `end` line closes the progress. Download lines come during the `load` stage. Matches come in their final order. Split the output at `\n` only: a file name can hold other line breaks. `date` is the date that `--date` and `--sort date` use: `taken` from EXIF, else the time the file changed. `taken` and `date` are local time. `modified` is UTC. A path that is not UTF-8 also comes as base64 in `path_bytes`. The exit status is 0 when the run ends, also with no match, and 2 on an error. New fields, types and codes can come in later versions, so ignore the ones you do not know. To pass a query that starts with `-`, write `--query=TEXT`.
+Each run ends with one `end` or one `error` line, unless a signal stops it, and the `end` line closes the progress. A `--watch` run ends only when it is stopped or reaches `-n`. Its first `progress` line with stage `watch` tells that the first pass is done. Download lines come during the `load` stage. Matches come in their final order. Split the output at `\n` only: a file name can hold other line breaks. `date` is the date that `--date` and `--sort date` use: `taken` from EXIF, else the time the file changed. `taken` and `date` are local time. `modified` is UTC. A path that is not UTF-8 also comes as base64 in `path_bytes`. The exit status is 0 when the run ends, also with no match, and 2 on an error. New fields, types and codes can come in later versions, so ignore the ones you do not know. To pass a query that starts with `-`, write `--query=TEXT`.
 
 ## How it works
 
