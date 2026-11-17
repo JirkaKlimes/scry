@@ -3,7 +3,7 @@ use std::{
     collections::HashSet,
     fmt,
     fs::{self, Metadata},
-    iter,
+    io, iter,
     num::NonZeroUsize,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -217,8 +217,7 @@ impl Progress {
         let listed = self.listed.load(Relaxed);
         let total = match stage {
             Stage::Text => listed,
-            // `listed` holds the images found before.
-            Stage::Watch => self.found() - listed,
+            Stage::Watch => self.done.load(Relaxed),
             _ => self.found(),
         };
         Snapshot {
@@ -664,7 +663,7 @@ impl Engine {
 
     /// --watch: each new image as it comes, in that order.
     fn stream(&self, live: &Receiver<PathBuf>, sink: &mut Sink) -> Result<()> {
-        self.progress.enter(Stage::Watch, self.progress.found());
+        self.progress.enter(Stage::Watch, 0);
         // A new image waits in the cache's memory until the next commit.
         self.cache.flush();
         let size = self.text_chunk();
@@ -672,9 +671,15 @@ impl Engine {
             let n = chunk.len();
             let mut cands = self.admit(chunk, false, None);
             if let Some(emitted) = &self.emitted {
+                // Events can send a path twice, also in one chunk.
                 let emitted = emitted.lock().unwrap();
-                cands.retain(|c| !emitted.contains(&(c.id, c.born)));
+                let mut chunk = HashSet::new();
+                cands.retain(|c| {
+                    let file = (c.id, c.born);
+                    !emitted.contains(&file) && chunk.insert(file)
+                });
             }
+            self.progress.done.fetch_add(cands.len(), Relaxed);
             if let Order::Ranked(ranker, ..) = &self.order {
                 cands = (self.rank(ranker, cands)?.into_iter())
                     .map(|(score, mut c)| {
@@ -684,7 +689,6 @@ impl Engine {
                     .collect();
             }
             let passed = self.read_text(cands);
-            self.progress.done.fetch_add(n, Relaxed);
             if !self.emit(passed, sink) {
                 break;
             }
@@ -803,17 +807,24 @@ impl Engine {
 
     /// `dated` reads the metadata for a date even without a metadata filter.
     /// `seen` drops the files that came before: overlapping paths find a file twice. It comes
-    /// before any check that can fail, so a failure counts once, and the first path wins.
+    /// before any check that can fail, so a failure counts once, and the first path wins. None
+    /// is the live phase of --watch, where a file that is gone or empty is not ready yet: a
+    /// writer that fills it sends it again.
     fn admit(
         &self,
         paths: Vec<PathBuf>,
         dated: bool,
         seen: Option<&mut HashSet<FileId>>,
     ) -> Vec<Cand> {
+        let live = seen.is_none();
         let mut files: Vec<(PathBuf, Metadata)> = (paths.into_par_iter())
-            .filter_map(|path| {
-                let md = self.ok(&path, fs::metadata(&path).map_err(Into::into))?;
-                Some((path, md))
+            .filter_map(|path| match fs::metadata(&path) {
+                Ok(md) if live && md.len() == 0 => None,
+                Err(e) if live && e.kind() == io::ErrorKind::NotFound => None,
+                md => {
+                    let md = self.ok(&path, md.map_err(Into::into))?;
+                    Some((path, md))
+                }
             })
             .collect();
         if let Some(seen) = seen {
