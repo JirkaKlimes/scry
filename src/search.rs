@@ -635,9 +635,9 @@ impl Engine {
                     let cands = self.read_text(self.admit(chunk, false, Some(&mut seen)));
                     self.progress.done.fetch_add(n, Relaxed);
                     if !self.emit(cands, sink) {
-                        // Images that wait in the walk are not checked.
-                        let left = paths.try_recv().is_ok() || !self.progress.walked.load(Relaxed);
-                        self.stopped(sink, left);
+                        // An image that waits in the walk is not checked.
+                        let full = sink.left == Some(0);
+                        self.stopped(sink, full && (sink.refused || paths.recv().is_ok()));
                         break;
                     }
                 }
@@ -707,6 +707,11 @@ impl Engine {
     }
 
     fn emit(&self, mut cands: Vec<Cand>, sink: &mut Sink) -> bool {
+        // The limit refuses the rest, so they need no metadata.
+        if let Some(left) = sink.left.filter(|&left| cands.len() > left) {
+            cands.truncate(left);
+            sink.refused = true;
+        }
         self.describe(&mut cands);
         if let Some(emitted) = &self.emitted {
             emitted
