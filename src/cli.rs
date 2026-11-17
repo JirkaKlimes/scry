@@ -44,9 +44,9 @@ const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
     group(ArgGroup::new("view").args(["scatter", "grid"])),
     after_help = format!("\
 RANGE is A..B, A.., ..B or A. Both ends are inclusive. A date covers its last part: 2024 is a \
-year, 2024-06-15T14 is an hour. An offset (Z, +02:00) turns a date into local time. An age (15m, \
-1h30m, 7d, 3mo, 1y) counts back from now: --date 7d is the last 7 days, ..1y is older than a \
-year. The words today and yesterday mean calendar days.
+year, 2024-06-15T14 is an hour. An offset after the hour (Z, +02:00) turns a date into local \
+time. An age (15m, 1h30m, 7d, 3mo, 1y) counts back from now: --date 7d is the last 7 days, ..1y \
+is older than a year. The words today and yesterday mean calendar days.
 
 Environment:
   SCRY_CACHE   Directory for the models and the cache
@@ -187,8 +187,9 @@ struct Args {
     #[arg(long, help_heading = "Output")]
     grid: bool,
 
-    /// In scatter or grid mode, run COMMAND when you press KEY (ctrl-a to ctrl-z, alt-a to alt-z,
-    /// f1 to f12). COMMAND gets the marked images, or else the selected one, as "$@" (repeatable)
+    /// In scatter or grid mode, run COMMAND when you press KEY (ctrl-a to ctrl-z but not c, h, i,
+    /// j or m, alt-a to alt-z, f1 to f12). COMMAND gets the marked images, or else the selected
+    /// one, as "$@" (repeatable)
     #[arg(
         long,
         value_name = "KEY:COMMAND",
