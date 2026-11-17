@@ -28,8 +28,8 @@ use crate::{
     meta::{self, Meta, MetaFilter},
     ocr::Ocr,
     output::clean_path,
-    report,
-    walk::{self, Found, Skipped, Source, WalkOpts},
+    pick, report,
+    walk::{self, Found, Skipped, Source, WalkOpts, Watch},
 };
 
 pub struct Query {
@@ -44,6 +44,7 @@ pub struct Query {
     pub describe: bool,
     pub order: Order,
     pub limit: Option<NonZeroUsize>,
+    pub watch: Option<Watch>,
 }
 
 /// A sorted order sends the first hit only after it has seen all images. `S` is what a score
@@ -173,6 +174,8 @@ pub enum Stage {
     Load,
     Score,
     Text,
+    /// --watch, after the first pass.
+    Watch,
 }
 
 /// How far a search is, at one moment.
@@ -192,6 +195,7 @@ impl fmt::Display for Snapshot {
             Stage::Check => "checked",
             Stage::Score => "scored",
             Stage::Text => "read",
+            Stage::Watch => return write!(f, "watching, {} new", self.total),
         };
         write!(f, "{}/{} {verb}", self.done, self.total)
     }
@@ -216,10 +220,14 @@ impl Progress {
             1 => Stage::Load,
             2 => Stage::Score,
             3 => Stage::Text,
+            4 => Stage::Watch,
             _ => Stage::Check,
         };
+        let listed = self.listed.load(Relaxed);
         let total = match stage {
-            Stage::Text => self.listed.load(Relaxed),
+            Stage::Text => listed,
+            // `listed` holds the images found before.
+            Stage::Watch => self.found() - listed,
             _ => self.found(),
         };
         Snapshot {
@@ -227,6 +235,20 @@ impl Progress {
             done: self.done.load(Relaxed),
             total,
             walking: !self.walked.load(Relaxed),
+        }
+    }
+
+    pub fn live(&self) -> bool {
+        self.stage.load(Relaxed) == Stage::Watch as u8
+    }
+
+    /// A --watch run tells at once, because it ends only when it is stopped. The picker owns
+    /// the terminal, so it gets the notes at the end.
+    fn fail(&self, path: Option<&Path>, reason: &dyn fmt::Display) {
+        if self.live() && !pick::active() {
+            report::unreadable(path, &format!("{reason:#}"));
+        } else {
+            self.unreadable.add(path, reason);
         }
     }
 
@@ -362,11 +384,15 @@ const EMBED_SIDE: u32 = 1024;
 /// Device and inode.
 type FileId = (u64, u64);
 
+/// A file and the time it was made, which tells apart a file that reuses a deleted inode.
+type Born = (FileId, Option<SystemTime>);
+
 pub fn run(query: Query) -> Result<Search> {
     let progress = Arc::new(Progress::default());
     // The walk starts first, so it runs while the models load.
-    let walk = walk::candidates(query.source, query.walk)?;
-    let paths = counted(walk.found, progress.clone());
+    let walk = walk::candidates(query.source, query.walk, query.watch)?;
+    let paths = counted(walk.found, progress.clone(), false);
+    let live = (walk.live).map(|live| counted(live, progress.clone(), true));
     let cache = Arc::new(Cache::open()?);
     crate::stop_on_signals(cache.clone())?;
     let reads_text = query.show_text || !query.text.is_empty();
@@ -394,10 +420,11 @@ pub fn run(query: Query) -> Result<Search> {
         describe: query.describe,
         order: sort,
         progress: progress.clone(),
+        emitted: live.as_ref().map(|_| Mutex::default()),
     };
     thread::spawn(move || {
         // Decoding runs on rten's pool too, so it never competes with inference for cores.
-        let run = catch(|| rten::thread_pool().run(|| engine.run(paths, &mut sink)));
+        let run = catch(|| rten::thread_pool().run(|| engine.run(paths, live, &mut sink)));
         if let Err(e) = run {
             let _ = sink.tx.send(Err(e));
         }
@@ -411,7 +438,8 @@ pub fn run(query: Query) -> Result<Search> {
     })
 }
 
-fn counted(found: Receiver<Found>, progress: Arc<Progress>) -> Receiver<PathBuf> {
+/// `live`: the images of --watch after the walk.
+fn counted(found: Receiver<Found>, progress: Arc<Progress>, live: bool) -> Receiver<PathBuf> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         for item in found {
@@ -422,7 +450,7 @@ fn counted(found: Receiver<Found>, progress: Arc<Progress>) -> Receiver<PathBuf>
                     continue;
                 }
                 Found::Error { path, reason } => {
-                    progress.unreadable.add(path.as_deref(), reason);
+                    progress.fail(path.as_deref(), &reason);
                     continue;
                 }
             };
@@ -431,7 +459,9 @@ fn counted(found: Receiver<Found>, progress: Arc<Progress>) -> Receiver<PathBuf>
                 break;
             }
         }
-        progress.walked.store(true, Relaxed);
+        if !live {
+            progress.walked.store(true, Relaxed);
+        }
     });
     rx
 }
@@ -567,11 +597,14 @@ struct Engine {
     describe: bool,
     order: Order<Ranker>,
     progress: Arc<Progress>,
+    /// With --watch: the files that went out, so a change does not send them twice.
+    emitted: Option<Mutex<HashSet<Born>>>,
 }
 
 struct Cand {
     key: Key,
     id: FileId,
+    born: Option<SystemTime>,
     hit: Hit,
     modified: SystemTime,
     /// When admission read it.
@@ -585,14 +618,19 @@ impl Cand {
 }
 
 impl Engine {
-    fn run(&self, paths: Receiver<PathBuf>, sink: &mut Sink) -> Result<()> {
+    fn run(
+        &self,
+        paths: Receiver<PathBuf>,
+        live: Option<Receiver<PathBuf>>,
+        sink: &mut Sink,
+    ) -> Result<()> {
         let mut seen = HashSet::new();
         self.progress.enter(Stage::Check, 0);
         match &self.order {
             Order::Found => {
                 for chunk in ready_chunks(&paths, self.text_chunk()) {
                     let n = chunk.len();
-                    let cands = self.read_text(self.admit(chunk, false, &mut seen));
+                    let cands = self.read_text(self.admit_new(chunk, false, &mut seen));
                     self.progress.done.fetch_add(n, Relaxed);
                     if !self.emit(cands, sink) {
                         // Images that wait in the walk are not checked.
@@ -605,7 +643,7 @@ impl Engine {
             Order::Sorted(field, dir) => {
                 let dated = *field == Field::Date;
                 let mut cands =
-                    self.gather(&paths, |chunk| Ok(self.admit(chunk, dated, &mut seen)))?;
+                    self.gather(&paths, |chunk| Ok(self.admit_new(chunk, dated, &mut seen)))?;
                 cands.sort_by(|a, b| compare(By::Field(*field), *dir, a, b));
                 self.send_sorted(cands, sink);
             }
@@ -613,7 +651,7 @@ impl Engine {
                 self.progress.enter(Stage::Score, 0);
                 let dated = *by == By::Field(Field::Date);
                 let scored = self.gather(&paths, |chunk| {
-                    self.rank(ranker, self.admit(chunk, dated, &mut seen))
+                    self.rank(ranker, self.admit_new(chunk, dated, &mut seen))
                 })?;
                 let best = best_first(scored);
                 if (*by, *dir) == (By::Score, Dir::Natural) {
@@ -626,11 +664,53 @@ impl Engine {
                 }
             }
         }
+        match live {
+            Some(live) if sink.left != Some(0) => self.stream(&live, sink),
+            _ => Ok(()),
+        }
+    }
+
+    /// --watch: each new image as it comes, in that order.
+    fn stream(&self, live: &Receiver<PathBuf>, sink: &mut Sink) -> Result<()> {
+        self.progress.enter(Stage::Watch, self.progress.found());
+        // A new image waits in the cache's memory until the next commit.
+        self.cache.flush();
+        let size = self.text_chunk();
+        for chunk in ready_chunks(live, size) {
+            let n = chunk.len();
+            let mut cands = self.admit(chunk, false);
+            if let Some(emitted) = &self.emitted {
+                let emitted = emitted.lock().unwrap();
+                cands.retain(|c| !emitted.contains(&(c.id, c.born)));
+            }
+            if let Order::Ranked(ranker, ..) = &self.order {
+                cands = (self.rank(ranker, cands)?.into_iter())
+                    .map(|(score, mut c)| {
+                        c.hit.score = Some(score);
+                        c
+                    })
+                    .collect();
+            }
+            let passed = self.read_text(cands);
+            self.progress.done.fetch_add(n, Relaxed);
+            if !self.emit(passed, sink) {
+                break;
+            }
+            if n < size {
+                self.cache.flush();
+            }
+        }
         Ok(())
     }
 
     fn emit(&self, mut cands: Vec<Cand>, sink: &mut Sink) -> bool {
         self.describe(&mut cands);
+        if let Some(emitted) = &self.emitted {
+            emitted
+                .lock()
+                .unwrap()
+                .extend(cands.iter().map(|c| (c.id, c.born)));
+        }
         sink.send(cands.into_iter().map(|c| c.hit))
     }
 
@@ -725,16 +805,19 @@ impl Engine {
     }
 
     /// `dated` reads the metadata for a date even without a metadata filter.
-    fn admit(&self, paths: Vec<PathBuf>, dated: bool, seen: &mut HashSet<FileId>) -> Vec<Cand> {
+    fn admit(&self, paths: Vec<PathBuf>, dated: bool) -> Vec<Cand> {
         let view = self.cache.view();
-        let mut cands: Vec<Cand> = paths
-            .into_par_iter()
+        (paths.into_par_iter())
             .filter_map(|path| {
                 self.ok(&path, self.admit_one(&view, &path, dated))
                     .flatten()
             })
-            .collect();
-        // Overlapping paths find a file twice. The first path wins, so threads do not decide.
+            .collect()
+    }
+
+    /// Overlapping paths find a file twice. The first path wins, so threads do not decide.
+    fn admit_new(&self, paths: Vec<PathBuf>, dated: bool, seen: &mut HashSet<FileId>) -> Vec<Cand> {
+        let mut cands = self.admit(paths, dated);
         cands.retain(|c| seen.insert(c.id));
         cands
     }
@@ -755,6 +838,7 @@ impl Engine {
         Ok(Some(Cand {
             key,
             id: (md.dev(), md.ino()),
+            born: md.created().ok(),
             hit: Hit::new(path.to_path_buf()),
             modified,
             meta,
@@ -811,7 +895,7 @@ impl Engine {
     /// Like `Result::ok`, but records the error.
     fn ok<T>(&self, path: &Path, result: Result<T>) -> Option<T> {
         result
-            .inspect_err(|e| self.progress.unreadable.add(Some(path), e))
+            .inspect_err(|e| self.progress.fail(Some(path), e))
             .ok()
     }
 }
@@ -916,6 +1000,7 @@ mod tests {
         Cand {
             key: Key::new(Path::new(name), &md),
             id: (0, 0),
+            born: None,
             hit: hit(name),
             modified: SystemTime::UNIX_EPOCH,
             meta: None,
@@ -980,6 +1065,7 @@ mod tests {
             describe: false,
             order,
             progress: Arc::default(),
+            emitted: None,
         }
     }
 
@@ -998,7 +1084,7 @@ mod tests {
         let (hits, got) = mpsc::channel();
         let mut sink = Sink::new(hits, None);
         let engine = engine(Order::Sorted(Field::Path, Dir::Natural), &[]);
-        engine.run(rx, &mut sink).unwrap();
+        engine.run(rx, None, &mut sink).unwrap();
         drop(sink);
         let names: Vec<PathBuf> = got.iter().map(|h| h.unwrap().path).collect();
         assert_eq!(names, [dir.join("a.png"), dir.join("b.png")]);

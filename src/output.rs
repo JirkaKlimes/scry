@@ -126,7 +126,11 @@ fn lines(search: Search, score: bool, preview: bool, shown: Shown, end: End) -> 
             return Ok(printed);
         }
         printed += 1;
-        hit = next(&search.hits, || out.flush(), || {})?;
+        hit = next(
+            &search.hits,
+            || out.flush(),
+            || report::watch(&search.progress),
+        )?;
     }
     out.flush()?;
     Ok(printed)

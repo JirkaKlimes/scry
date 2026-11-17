@@ -328,8 +328,12 @@ impl Scatter {
 }
 
 impl Board for Scatter {
-    fn push(&mut self, hit: Hit) {
-        self.feed.push(hit);
+    fn push(&mut self, hit: Hit, new: bool) {
+        if new {
+            self.feed.push_new(hit);
+        } else {
+            self.feed.push(hit);
+        }
     }
 
     /// Starts a new pile, at the same speed and size.

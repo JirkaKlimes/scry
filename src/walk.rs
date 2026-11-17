@@ -20,6 +20,10 @@ use crate::{
     output::{End, clean_path},
 };
 
+mod watch;
+
+pub use watch::Watch;
+
 pub struct Source {
     pub paths: Vec<PathBuf>,
     /// Paths on stdin, each ended by this byte.
@@ -58,6 +62,8 @@ impl Found {
 
 pub struct Walk {
     pub found: Receiver<Found>,
+    /// With --watch: the images that come after the walk.
+    pub live: Option<Receiver<Found>>,
     /// What a directory walk left out. None without a directory walk or filters.
     pub skipped: Option<Skipped>,
 }
@@ -71,8 +77,11 @@ pub enum Skipped {
 }
 
 /// Globs filter every path. File arguments and stdin paths skip the hidden and ignore filters.
-pub fn candidates(source: Source, opts: WalkOpts) -> Result<Walk> {
+/// With --watch, the watches go up before the walk enters a directory, so no new image falls
+/// between the two.
+pub fn candidates(source: Source, opts: WalkOpts, watch: Option<Watch>) -> Result<Walk> {
     let (tx, found) = mpsc::channel();
+    let files = watch != Some(Watch::New);
     let mut dirs = Vec::new();
     for path in source.paths {
         let context = || clean_path(&path).to_string();
@@ -81,10 +90,20 @@ pub fn candidates(source: Source, opts: WalkOpts) -> Result<Walk> {
             // with the reason.
             fs::read_dir(&path).with_context(context)?;
             dirs.push(path);
-        } else if let Some(found) = wanted(&path, &opts.globs) {
+        } else if let Some(found) = wanted(&path, &opts.globs).filter(|_| files) {
             tx.send(found).expect("the receiver is in this function");
         }
     }
+    let (watcher, live) = match watch {
+        Some(_) => {
+            let (watcher, events) = watch::Dirs::new()?;
+            dirs.iter().for_each(|dir| watcher.root(dir));
+            let (tx, live) = mpsc::channel();
+            watch::follow(events, &dirs, opts.clone(), watcher.clone(), tx)?;
+            (Some(watcher), Some(live))
+        }
+        None => (None, None),
+    };
     let skipped = match (opts.hidden, opts.no_ignore) {
         _ if dirs.is_empty() => None,
         (false, false) => Some(Skipped::Both),
@@ -98,8 +117,12 @@ pub fn candidates(source: Source, opts: WalkOpts) -> Result<Walk> {
         let (opts, tx) = (opts.clone(), tx.clone());
         thread::spawn(move || read_list(BufReader::new(input), end, &opts, &tx));
     }
-    walk(&dirs, opts, tx);
-    Ok(Walk { found, skipped })
+    walk(&dirs, opts, watcher, files, tx);
+    Ok(Walk {
+        found,
+        live,
+        skipped,
+    })
 }
 
 /// Globs ignore case, and a leading ! excludes. A glob with a slash matches a walked path from
@@ -134,7 +157,10 @@ fn read_list(input: impl BufRead, end: End, opts: &WalkOpts, tx: &Sender<Found>)
         let path = PathBuf::from(OsString::from_vec(line));
         let mut found: Box<dyn Iterator<Item = Found>> = match wanted(&path, &opts.globs) {
             Some(found) => Box::new(iter::once(found)),
-            None if path.is_dir() => Box::new(builder(&path, opts).build().filter_map(entry)),
+            None if path.is_dir() => {
+                let walk = builder(&path, Path::new(""), opts, None).build();
+                Box::new(walk.filter_map(entry))
+            }
             None => continue,
         };
         if !found.all(|found| tx.send(found).is_ok()) {
@@ -143,11 +169,18 @@ fn read_list(input: impl BufRead, end: End, opts: &WalkOpts, tx: &Sender<Found>)
     }
 }
 
-fn walk(dirs: &[PathBuf], opts: WalkOpts, tx: Sender<Found>) {
+/// `files`: send the images, not only the errors. --watch=new walks only to add the watches.
+fn walk(
+    dirs: &[PathBuf],
+    opts: WalkOpts,
+    watcher: Option<watch::Dirs>,
+    files: bool,
+    tx: Sender<Found>,
+) {
     let Some((first, rest)) = dirs.split_first() else {
         return;
     };
-    let mut builder = builder(first, &opts);
+    let mut builder = builder(first, Path::new(""), &opts, watcher.as_ref());
     for dir in rest {
         builder.add(dir);
     }
@@ -155,16 +188,30 @@ fn walk(dirs: &[PathBuf], opts: WalkOpts, tx: Sender<Found>) {
     thread::spawn(move || {
         walker.run(|| {
             let tx = tx.clone();
-            Box::new(move |e| match entry(e).map(|found| tx.send(found)) {
-                Some(Err(_)) => WalkState::Quit,
+            Box::new(move |e| match entry(e) {
+                Some(found @ Found::Error { .. }) => send(&tx, found),
+                Some(found) if files => send(&tx, found),
                 _ => WalkState::Continue,
             })
         })
     });
 }
 
-fn builder(dir: &Path, opts: &WalkOpts) -> WalkBuilder {
-    let globs = opts.globs.clone();
+fn send(tx: &Sender<Found>, found: Found) -> WalkState {
+    match tx.send(found) {
+        Ok(()) => WalkState::Continue,
+        Err(_) => WalkState::Quit,
+    }
+}
+
+/// `under` is the path of `dir` below its walk root, for the globs.
+fn builder(
+    dir: &Path,
+    under: &Path,
+    opts: &WalkOpts,
+    watcher: Option<&watch::Dirs>,
+) -> WalkBuilder {
+    let (globs, under, watcher) = (opts.globs.clone(), under.to_path_buf(), watcher.cloned());
     let mut builder = WalkBuilder::new(dir);
     // As walker overrides, an include glob would also admit hidden and ignored files.
     // Globs here only narrow the walk.
@@ -173,13 +220,21 @@ fn builder(dir: &Path, opts: &WalkOpts) -> WalkBuilder {
         .hidden(!opts.hidden)
         .filter_entry(move |e| {
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
-            // The Photos library of macOS holds several copies of each photo, and macOS guards
-            // it. As a walk root, it is still searched.
-            let photos = is_dir
-                && (e.path().extension()).is_some_and(|x| x.eq_ignore_ascii_case("photoslibrary"));
-            !photos && !globs.matched(relative(e), is_dir).is_ignore()
+            let pass = allowed(&globs, &under.join(relative(e)), is_dir);
+            if let Some(watcher) = watcher.as_ref().filter(|_| pass && is_dir) {
+                watcher.add(e.path());
+            }
+            pass
         });
     builder
+}
+
+/// The globs, and no Photos library: it holds several copies of each photo, and macOS guards
+/// it. As a walk root, it is still searched. `below` is the path below the walk root.
+fn allowed(globs: &Override, below: &Path, is_dir: bool) -> bool {
+    let photos =
+        is_dir && (below.extension()).is_some_and(|x| x.eq_ignore_ascii_case("photoslibrary"));
+    !photos && !globs.matched(below, is_dir).is_ignore()
 }
 
 /// An image, or an error. Other entries give None.
@@ -258,7 +313,11 @@ mod tests {
     }
 
     fn found(source: Source, opts: WalkOpts) -> Vec<Found> {
-        candidates(source, opts).unwrap().found.iter().collect()
+        candidates(source, opts, None)
+            .unwrap()
+            .found
+            .iter()
+            .collect()
     }
 
     fn image(found: Found) -> Option<PathBuf> {
@@ -391,7 +450,7 @@ mod tests {
             names(source(), opts(&["!skip.jpg", "!*.bmp"]), &root),
             set(&[".e.jpg", "sub/c.webp"])
         );
-        assert!(candidates(paths(vec![root.join("missing.jpg")]), opts(&[])).is_err());
+        assert!(candidates(paths(vec![root.join("missing.jpg")]), opts(&[]), None).is_err());
         assert!(globs(["a[b"]).is_err());
     }
 
@@ -477,7 +536,7 @@ mod tests {
                 no_ignore,
                 ..opts(&[])
             };
-            candidates(paths(dirs), opts).unwrap().skipped
+            candidates(paths(dirs), opts, None).unwrap().skipped
         };
         let dir = || vec![root.to_path_buf()];
         assert_eq!(skipped(dir(), false, false), Some(Skipped::Both));

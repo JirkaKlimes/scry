@@ -13,6 +13,8 @@ const LAMBDA: f32 = 0.5;
 
 pub struct Feed {
     heap: BinaryHeap<Entry>,
+    /// New images of --watch, which come before all others.
+    fresh: VecDeque<Hit>,
     recent: VecDeque<Arc<[f32]>>,
     seq: u64,
     /// None keeps the order in which the hits come.
@@ -36,6 +38,7 @@ impl Feed {
     fn new(shuffle: Option<RandomState>) -> Self {
         Self {
             heap: BinaryHeap::new(),
+            fresh: VecDeque::new(),
             recent: VecDeque::with_capacity(RECENT),
             seq: 0,
             shuffle,
@@ -45,7 +48,12 @@ impl Feed {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.heap.is_empty() && self.fresh.is_empty()
+    }
+
+    pub fn push_new(&mut self, hit: Hit) {
+        self.scale(&hit);
+        self.fresh.push_back(hit);
     }
 
     pub fn push(&mut self, hit: Hit) {
@@ -68,24 +76,24 @@ impl Feed {
     }
 
     fn insert(&mut self, key: u64, hit: Hit) {
+        self.scale(&hit);
+        self.heap.push(Entry { key, hit });
+    }
+
+    fn scale(&mut self, hit: &Hit) {
         if let Some(s) = hit.score {
             self.lo = self.lo.min(s);
             self.hi = self.hi.max(s);
         }
-        self.heap.push(Entry { key, hit });
     }
 
     /// Next hit to show and its emphasis in 0..=1: the best of the top few after an MMR
     /// penalty for looking like recently picked hits.
     pub fn pop(&mut self) -> Option<(Hit, f32)> {
-        let mut top: Vec<Entry> = (0..TOP).map_while(|_| self.heap.pop()).collect();
-        let values: Vec<f32> = top.iter().map(|e| self.value(&e.hit)).collect();
-        // rev: max_by keeps the last maximum, so ties go to the best heap entry.
-        let best = (0..top.len())
-            .rev()
-            .max_by(|&a, &b| values[a].total_cmp(&values[b]))?;
-        let hit = top.swap_remove(best).hit;
-        self.heap.extend(top);
+        let hit = match self.fresh.pop_front() {
+            Some(hit) => hit,
+            None => self.pick()?,
+        };
         if let Some(e) = &hit.embedding {
             if self.recent.len() == RECENT {
                 self.recent.pop_front();
@@ -94,6 +102,18 @@ impl Feed {
         }
         let emphasis = self.emphasis(&hit);
         Some((hit, emphasis))
+    }
+
+    fn pick(&mut self) -> Option<Hit> {
+        let mut top: Vec<Entry> = (0..TOP).map_while(|_| self.heap.pop()).collect();
+        let values: Vec<f32> = top.iter().map(|e| self.value(&e.hit)).collect();
+        // rev: max_by keeps the last maximum, so ties go to the best heap entry.
+        let best = (0..top.len())
+            .rev()
+            .max_by(|&a, &b| values[a].total_cmp(&values[b]))?;
+        let hit = top.swap_remove(best).hit;
+        self.heap.extend(top);
+        Some(hit)
     }
 
     fn emphasis(&self, hit: &Hit) -> f32 {
@@ -161,6 +181,14 @@ mod tests {
         std::iter::from_fn(|| feed.pop())
             .map(|(h, _)| h.path.display().to_string())
             .collect()
+    }
+
+    #[test]
+    fn new_hits_come_first() {
+        let mut feed = Feed::shuffled();
+        (0..5).for_each(|i| feed.push(hit(&i.to_string(), Some(1.0), None)));
+        feed.push_new(hit("new", Some(0.0), None));
+        assert_eq!(feed.pop().unwrap().0.path, PathBuf::from("new"));
     }
 
     #[test]

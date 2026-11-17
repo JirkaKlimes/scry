@@ -20,7 +20,7 @@ use crate::{
     output::{self, End, ListOpts, Out, Shown, clean_path},
     pick::{Bind, View},
     search::{By, Dir, Field, Order, Query, Rank, Scoring},
-    walk::{self, Source, WalkOpts},
+    walk::{self, Source, WalkOpts, Watch},
 };
 
 pub enum Mode {
@@ -159,6 +159,19 @@ struct Args {
     #[arg(long, help_heading = "Files")]
     no_ignore: bool,
 
+    /// Keep watching the directories, and search each new image. With =new, skip the images
+    /// that exist now
+    #[arg(
+        long,
+        value_name = "new",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "all",
+        hide_possible_values = true,
+        help_heading = "Files"
+    )]
+    watch: Option<Watch>,
+
     /// Show the images one at a time over the terminal and pick by eye
     #[arg(short, long, help_heading = "Output")]
     scatter: bool,
@@ -267,10 +280,23 @@ impl Args {
             _ => None,
         };
         let rank = rank(self.query, self.not, self.like);
+        if let (Some(_), Some(rank), None) = (self.watch, &rank, self.min) {
+            return Err(Args::command().error(
+                ErrorKind::MissingRequiredArgument,
+                format!(
+                    "--watch with {} needs --min: a new image goes out when its score is high enough",
+                    rank.flag()
+                ),
+            ));
+        }
         let order = order(rank, self.sort, self.reverse, self.min, self.limit, view)?;
         let end = if self.null { End::Nul } else { End::Newline };
+        let source = source(self.paths, end);
+        if self.watch.is_some() {
+            check_watch(&source)?;
+        }
         let query = Query {
-            source: source(self.paths, end),
+            source,
             walk: WalkOpts {
                 hidden: self.hidden,
                 no_ignore: self.no_ignore,
@@ -285,7 +311,8 @@ impl Args {
             },
             show_text: self.show_text,
             describe: self.json,
-            limit: limit_or_default(self.limit, &order, view.is_some()),
+            limit: limit_or_default(self.limit, &order, view.is_some() || self.watch.is_some()),
+            watch: self.watch,
             order,
             text,
         };
@@ -429,12 +456,28 @@ fn is_stdin(path: &Path) -> bool {
     path.as_os_str() == "-"
 }
 
-/// A ranked search prints the best few, unless it has a cutoff or you pick by eye.
-fn limit_or_default(limit: Option<Limit>, order: &Order, pick: bool) -> Option<NonZeroUsize> {
+/// --watch reads directories, and new images come only from there.
+fn check_watch(source: &Source) -> Result<(), clap::Error> {
+    if source.stdin.is_some() {
+        return Err(conflict(
+            "--watch reads new images from directories, not from stdin",
+        ));
+    }
+    if !source.paths.iter().any(|p| p.is_dir()) {
+        return Err(Args::command().error(
+            ErrorKind::MissingRequiredArgument,
+            "--watch needs a directory",
+        ));
+    }
+    Ok(())
+}
+
+/// A ranked search prints the best few, unless it has a cutoff, you pick by eye, or it watches.
+fn limit_or_default(limit: Option<Limit>, order: &Order, open: bool) -> Option<NonZeroUsize> {
     match limit {
         Some(Limit::All) => None,
         Some(Limit::First(n)) => Some(n),
-        None => matches!(order, Order::Ranked(s, ..) if s.min.is_none() && !pick)
+        None => matches!(order, Order::Ranked(s, ..) if s.min.is_none() && !open)
             .then_some(DEFAULT_LIMIT),
     }
 }
@@ -883,6 +926,26 @@ mod tests {
             message(&e),
             "unexpected argument '--hiden' found\n\n  tip: a similar argument exists: '--hidden'"
         );
+    }
+
+    #[test]
+    fn watch_rules() {
+        let (q, _) = parse(&["--watch", "src"]).unwrap();
+        assert_eq!(q.watch, Some(Watch::All));
+        let (q, _) = parse(&["--watch=new", "-q", "cat", "--min", "0.1", "src"]).unwrap();
+        assert_eq!((q.watch, q.limit), (Some(Watch::New), None));
+        assert_eq!(
+            err(&["--watch", "-q", "cat", "src"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            err(&["--watch", "Cargo.toml"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(err(&["--watch", "-", "src"]), ErrorKind::ArgumentConflict);
+        assert_eq!(err(&["--watch=old", "src"]), ErrorKind::InvalidValue);
+        let (q, _) = parse(&["--watch", "src", "Cargo.toml"]).unwrap();
+        assert_eq!(q.source.paths.len(), 2);
     }
 
     #[test]
