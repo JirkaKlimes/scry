@@ -329,9 +329,7 @@ impl Args {
             text,
         };
         let out = if self.json {
-            Out::Json {
-                matches: !query.text.is_empty(),
-            }
+            Out::Json
         } else {
             let shown = match (self.show_text, query.text.is_empty()) {
                 (false, _) => Shown::Nothing,
@@ -919,7 +917,7 @@ mod tests {
         assert!(matches!(
             mode,
             Mode::List(ListOpts {
-                out: Out::Json { matches: true },
+                out: Out::Json,
                 cut: None
             })
         ));

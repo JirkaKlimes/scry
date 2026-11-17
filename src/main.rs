@@ -82,9 +82,9 @@ fn run() -> Result<ExitCode> {
     let (matched, cut, quit) = match mode {
         Mode::List(opts) => (output::list(search, &opts.out)?, opts.cut, false),
         Mode::Pick { view, binds, end } => match pick::run(search, view, binds)? {
-            Exit::Picked(paths) => {
-                output::paths(&paths, end)?;
-                (paths.len(), None, false)
+            Exit::Picked(hits) => {
+                output::hits(&hits, end)?;
+                (hits.len(), None, false)
             }
             Exit::Empty => (0, None, false),
             Exit::Aborted => (0, None, true),

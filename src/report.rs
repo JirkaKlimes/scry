@@ -132,7 +132,7 @@ struct Match<'a> {
 }
 
 impl<'a> Match<'a> {
-    fn new(hit: &'a Hit, matches: bool) -> Self {
+    fn new(hit: &'a Hit) -> Self {
         let file = hit.file.as_ref();
         let meta = file.and_then(|f| f.meta.as_ref());
         Self {
@@ -145,7 +145,7 @@ impl<'a> Match<'a> {
             height: meta.map(|m| m.height),
             camera: meta.and_then(|m| m.exif.camera.as_deref()),
             gps: meta.map(|m| m.exif.gps),
-            matches: matches.then_some(&hit.matches),
+            matches: hit.matches.as_deref(),
             text: hit.text.as_deref(),
         }
     }
@@ -169,9 +169,8 @@ fn emit(event: &Event) -> io::Result<bool> {
     output::has_reader(out.write_all(&line).and_then(|()| out.flush()))
 }
 
-/// `matches`: the search has text patterns.
-pub fn hit(hit: &Hit, matches: bool) -> io::Result<bool> {
-    emit(&Event::Match(Match::new(hit, matches)))
+pub fn hit(hit: &Hit) -> io::Result<bool> {
+    emit(&Event::Match(Match::new(hit)))
 }
 
 const TICK: Duration = Duration::from_millis(100);
@@ -560,13 +559,16 @@ mod tests {
     #[test]
     fn paths_that_are_not_utf8_keep_their_bytes() {
         let hit = Hit::new(PathBuf::from(OsStr::from_bytes(b"a\xffb.jpg")));
-        let json = line(&Event::Match(Match::new(&hit, false)));
+        let json = line(&Event::Match(Match::new(&hit)));
         assert!(
             json.starts_with(r#"{"type":"match","path":"a�b.jpg","path_bytes":"Yf9iLmpwZw==""#),
             "{json}"
         );
-        let hit = Hit::new("ok.jpg".into());
-        let json = line(&Event::Match(Match::new(&hit, true)));
+        let hit = Hit {
+            matches: Some(Vec::new()),
+            ..Hit::new("ok.jpg".into())
+        };
+        let json = line(&Event::Match(Match::new(&hit)));
         assert_eq!(
             json,
             r#"{"type":"match","path":"ok.jpg","date":null,"taken":null,"modified":null,"width":null,"height":null,"camera":null,"gps":null,"matches":[]}"#

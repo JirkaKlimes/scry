@@ -7,7 +7,7 @@ use std::{
         fd::{AsFd, BorrowedFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         LazyLock,
         mpsc::{Receiver, RecvTimeoutError, TryRecvError},
@@ -42,7 +42,7 @@ use rustix::{
 
 use crate::{
     decode, report,
-    search::{FileInfo, Hit, Search},
+    search::{Hit, Search},
 };
 
 pub struct ListOpts {
@@ -58,8 +58,7 @@ pub enum Out {
         shown: Shown,
         end: End,
     },
-    /// `matches`: the search has text patterns.
-    Json { matches: bool },
+    Json,
 }
 
 /// What follows the path in a line.
@@ -98,7 +97,7 @@ pub fn list(search: Search, out: &Out) -> Result<usize> {
             shown,
             end,
         } => lines(search, score, preview, shown, end),
-        Out::Json { matches } => json(search, matches),
+        Out::Json => json(search),
     }
 }
 
@@ -120,7 +119,7 @@ fn lines(search: Search, score: bool, preview: bool, shown: Shown, end: End) -> 
         let fields = match shown {
             Shown::Nothing => &[],
             Shown::Text => h.text.as_slice(),
-            Shown::Matches => h.matches.as_slice(),
+            Shown::Matches => h.matches.as_deref().unwrap_or_default(),
         };
         if !out.record(h.score.filter(|_| score), &h.path, fields)? {
             return Ok(printed);
@@ -136,13 +135,13 @@ fn lines(search: Search, score: bool, preview: bool, shown: Shown, end: End) -> 
     Ok(printed)
 }
 
-fn json(search: Search, matches: bool) -> Result<usize> {
+fn json(search: Search) -> Result<usize> {
     let tick = || report::progress(&search.progress);
     let mut printed = 0;
     let mut hit = next(&search.hits, || Ok(true), tick)?;
     while let Some(h) = hit {
         tick();
-        if !report::hit(&h, matches)? {
+        if !report::hit(&h)? {
             return Ok(printed);
         }
         printed += 1;
@@ -152,22 +151,18 @@ fn json(search: Search, matches: bool) -> Result<usize> {
 }
 
 /// The images that a picker returns.
-pub fn paths(paths: &[PathBuf], end: End) -> io::Result<()> {
+pub fn hits(hits: &[Hit], end: End) -> io::Result<()> {
     if report::json() {
-        for path in paths {
-            let hit = Hit {
-                file: FileInfo::read(path).ok(),
-                ..Hit::new(path.clone())
-            };
-            if !report::hit(&hit, false)? {
+        for hit in hits {
+            if !report::hit(hit)? {
                 return Ok(());
             }
         }
         return Ok(());
     }
     let mut out = Printer::stdout(end);
-    for path in paths {
-        if !out.record(None, path, &[])? {
+    for hit in hits {
+        if !out.record(None, &hit.path, &[])? {
             return Ok(());
         }
     }
@@ -474,7 +469,7 @@ fn draw(out: &mut impl Write, buf: &Buffer) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::ffi::OsStringExt;
+    use std::{os::unix::ffi::OsStringExt, path::PathBuf};
 
     use super::*;
 
