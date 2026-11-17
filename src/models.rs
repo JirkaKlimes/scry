@@ -1,14 +1,16 @@
 use std::{
     fs::{self, File, TryLockError},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
+    thread,
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail};
 use indicatif::{DecimalBytes, ProgressBar, ProgressStyle};
 use rten::Model;
 use sha2::{Digest, Sha256};
+use ureq::http::StatusCode;
 
 use crate::{cache, output::clean_path};
 
@@ -18,6 +20,8 @@ pub struct Asset {
     pub name: &'static str,
     pub url: &'static str,
     pub sha256: &'static str,
+    /// In bytes. The progress shows it before the server answers.
+    pub size: u64,
 }
 
 pub fn fetch(asset: &Asset) -> Result<PathBuf> {
@@ -28,13 +32,15 @@ pub fn fetch(asset: &Asset) -> Result<PathBuf> {
     }
     fs::create_dir_all(&dir)?;
     // The lock makes a concurrent scry wait for this download. An interrupted download leaves
-    // only this file, and the next run starts it again.
+    // this file, and the next run continues it.
     let part = dir.join(format!("{}.part", asset.name));
     let mut file = File::options()
         .create(true)
+        .read(true)
         .write(true)
         .truncate(false)
         .open(&part)?;
+    let bar = progress(asset)?;
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
@@ -42,19 +48,41 @@ pub fn fetch(asset: &Asset) -> Result<PathBuf> {
                 "scry: waiting for another scry to download the {}",
                 asset.label
             );
-            file.lock()?;
+            wait_for_lock(&file, &bar)?;
         }
         Err(TryLockError::Error(e)) => return Err(e.into()),
     }
     if path.exists() {
         let _ = fs::remove_file(&part);
     } else {
-        file.set_len(0)?;
-        download(asset, &mut file, &dir)
+        // Also without a terminal, where the bar does not show, so a log tells why a run is slow.
+        bar.suspend(|| {
+            eprintln!(
+                "scry: downloading the {} ({}) to {}. Later runs use this copy.",
+                asset.label,
+                DecimalBytes(asset.size),
+                clean_path(&dir)
+            )
+        });
+        download(asset, &mut file, &bar)
             .with_context(|| format!("cannot download the {}", asset.label))?;
         fs::rename(&part, &path)?;
     }
+    bar.finish_and_clear();
     Ok(path)
+}
+
+/// Shows the progress of the scry that holds the lock, from the size of its file.
+fn wait_for_lock(file: &File, bar: &ProgressBar) -> Result<()> {
+    loop {
+        bar.set_position(file.metadata()?.len());
+        thread::sleep(Duration::from_millis(100));
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
 }
 
 /// True when `fetch` needs no download.
@@ -78,18 +106,39 @@ pub fn cannot_load(path: &Path) -> String {
     )
 }
 
-fn download(asset: &Asset, file: &mut File, dir: &Path) -> Result<()> {
-    let mut resp = agent().get(asset.url).call().context(asset.url)?;
-    let bar = progress(asset, resp.body().content_length(), dir)?;
-    let sha256 = copy_hashed(bar.wrap_read(resp.body_mut().as_reader()), file)?;
-    file.sync_all()?;
-    bar.finish_and_clear();
-    ensure!(
-        sha256 == asset.sha256,
-        "checksum mismatch for {}: expected {}, got {sha256}",
-        asset.name,
-        asset.sha256
-    );
+/// Continues from the bytes that an earlier run wrote, if the server can send the rest.
+fn download(asset: &Asset, file: &mut File, bar: &ProgressBar) -> Result<()> {
+    let mut hasher = Sha256::new();
+    let mut done = copy_hashed(&*file, io::sink(), &mut hasher)?;
+    if done < asset.size {
+        let mut resp = (agent().get(asset.url))
+            .header("Range", format!("bytes={done}-"))
+            .call()
+            .context(asset.url)?;
+        if resp.status() != StatusCode::PARTIAL_CONTENT {
+            file.set_len(0)?;
+            file.rewind()?;
+            hasher = Sha256::new();
+            done = 0;
+        }
+        bar.set_position(done);
+        copy_hashed(
+            bar.wrap_read(resp.body_mut().as_reader()),
+            &*file,
+            &mut hasher,
+        )?;
+        file.sync_all()?;
+    }
+    let sha256 = hex(&hasher.finalize());
+    if sha256 != asset.sha256 {
+        // The next run starts again from zero.
+        file.set_len(0)?;
+        bail!(
+            "checksum mismatch for {}: expected {}, got {sha256}",
+            asset.name,
+            asset.sha256
+        );
+    }
     Ok(())
 }
 
@@ -104,38 +153,29 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-/// Also prints a line, because without a terminal the bar does not show. A log then tells why
-/// the run is slow.
-fn progress(asset: &Asset, size: Option<u64>, dir: &Path) -> Result<ProgressBar> {
-    let size_text = size
-        .map(|n| format!(" ({})", DecimalBytes(n)))
-        .unwrap_or_default();
-    eprintln!(
-        "scry: downloading the {}{size_text} to {}. Later runs use this copy.",
-        asset.label,
-        clean_path(dir)
-    );
+fn progress(asset: &Asset) -> Result<ProgressBar> {
     let style =
         ProgressStyle::with_template("{msg} {bar:30} {decimal_bytes}/{decimal_total_bytes} {eta}")?;
-    Ok(ProgressBar::new(size.unwrap_or(0))
+    Ok(ProgressBar::new(asset.size)
         .with_style(style)
         .with_message(asset.label))
 }
 
-fn copy_hashed(mut from: impl Read, to: &mut impl Write) -> io::Result<String> {
-    let mut hasher = Sha256::new();
+/// Returns the number of bytes.
+fn copy_hashed(mut from: impl Read, mut to: impl Write, hasher: &mut Sha256) -> io::Result<u64> {
     let mut buf = vec![0; 1 << 16];
+    let mut total = 0;
     loop {
         let n = from.read(&mut buf)?;
         if n == 0 {
-            break;
+            return Ok(total);
         }
         hasher.update(&buf[..n]);
         to.write_all(&buf[..n])?;
+        total += n as u64;
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
