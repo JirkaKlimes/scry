@@ -157,9 +157,9 @@ impl FileInfo {
 /// `done` counts the images of the current stage.
 #[derive(Default)]
 pub struct Progress {
-    pub found: AtomicUsize,
-    pub done: AtomicUsize,
-    pub unsupported: AtomicUsize,
+    found: AtomicUsize,
+    done: AtomicUsize,
+    unsupported: AtomicUsize,
     pub unreadable: Unreadable,
     stage: AtomicU8,
     /// The candidates of the text stage after a sort.

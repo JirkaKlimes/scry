@@ -64,7 +64,7 @@ pub struct Walk {
     pub found: Receiver<Found>,
     /// With --watch: the images that come after the walk.
     pub live: Option<Receiver<Found>>,
-    /// What a directory walk left out. None without a directory walk or filters.
+    /// What the walk of the directory PATHs left out. None without one, or without filters.
     pub skipped: Option<Skipped>,
 }
 
