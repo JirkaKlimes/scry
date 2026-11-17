@@ -15,7 +15,7 @@ scry --date 2024-06..2024-08 --gps ~/Pictures    # metadata
 scry --grid -q "foggy forest" ~/Pictures         # pick by eye
 ```
 
-scry prints paths, so it works in pipelines. After a one-time model download it works offline. It runs on your CPU, and uses a fast GPU if it finds one.
+scry prints paths for pipelines, or JSON Lines for other programs. After a one-time model download it works offline. It runs on your CPU, and uses a fast GPU if it finds one.
 
 ## Install
 
@@ -46,15 +46,25 @@ scry -l IMG_2041.jpg ~/Pictures
 scry --date 2024-06..2024-08 --camera fuji --width 4000.. ~/Pictures
 
 # PNG images from the last 7 days, and the newest screenshot that shows an error
-scry -g '*.png' --date 7d.. ~
-scry --order newest -n 1 -t error ~/Pictures/Screenshots
+scry -g '*.png' --date 7d ~
+scry --sort date -n 1 -t error ~/Pictures/Screenshots
+
+# Photos from one afternoon, and screenshots from the last 30 minutes
+scry --date 2024-06-15T13..2024-06-15T18 ~/Pictures
+scry --date 30m ~/Pictures/Screenshots
 
 # The text that scry reads, and each invoice number with its file
 scry -o screenshot.png
 scry -o -t 'INV-\d{4}' ~/scans
 
-# Receipts, newest first: choose by meaning, then sort by date
-scry -q "a receipt" --min 0.01 ~/Documents | scry --order newest
+# The 50 best receipts, newest first
+scry -q "a receipt" -n 50 --sort date ~/Documents
+
+# Each new screenshot that shows an error, as it comes
+scry --watch=new -t error ~/Pictures/Screenshots
+
+# Move each new receipt out of Downloads
+scry --watch=new -0 -q "a receipt" --min 0.02 ~/Downloads | xargs -0 -I{} mv {} ~/Receipts/
 
 # Pick images by eye and open them (on macOS, use open)
 scry -s -0 -q "a receipt" ~/Downloads | xargs -0 -r -n1 xdg-open
@@ -64,6 +74,8 @@ fd -0 -e jpg . ~/Pictures | scry -0 -t invoice | xargs -0 -I{} cp {} ~/invoices
 ```
 
 `scry --help` shows all options.
+
+`--watch` searches the directories as usual, then keeps watching them and searches each new image the same way. `--watch=new` shows only the new images. With `-q` or `-l` it needs `--min`: a new image goes out when its score is high enough.
 
 ## Pick by eye
 
@@ -94,7 +106,32 @@ scry --grid --bind 'ctrl-d:cp -- "$@" ~/picked/' --bind 'ctrl-x:gio trash -- "$@
 scry --grid -q "a diagram" --bind 'ctrl-y:wl-copy < "$1"' ~/Documents
 ```
 
+With `--watch`, a new image lands on the pile next in scatter mode, and at the end in grid mode.
+
 kitty, Ghostty, iTerm2, WezTerm, foot and other terminals with sixel support show full-resolution images, also in tmux. Other terminals get Unicode half blocks.
+
+## Use from other programs
+
+`--json` prints JSON Lines on stdout, one object per line, so a launcher or a script can show progress and results as they come. Give the paths, or `-` to read a list of paths on stdin.
+
+| `type` | Fields |
+|---|---|
+| `download` | `label`, `done`, `total` in bytes, while a model downloads |
+| `progress` | `stage` (`load`, `check`, `score`, `text`, `watch`), `done`, `total`, `walking` |
+| `match` | `path`, `score` with `-q` or `-l`, `date`, `taken`, `modified`, `width`, `height`, `camera`, `gps`, `matches` with `-t`, `text` with `-o` |
+| `warning` | `code`, `message`, `path` for a file that scry cannot read |
+| `end` | `matched`, `truncated`, `found`, `unsupported`, `unreadable` |
+| `error` | `code` (`usage`, `download`, `other`), `message` |
+
+```sh
+scry --json -n 1 -q "a red car" ~/Pictures
+{"type":"progress","stage":"load","done":0,"total":1311,"walking":true}
+{"type":"progress","stage":"score","done":1311,"total":1311,"walking":false}
+{"type":"match","path":"/home/me/Pictures/IMG_2041.jpg","score":0.0412,"date":"2024-06-15T14:30:05","taken":"2024-06-15T14:30:05","modified":"2024-06-16T08:12:44Z","width":4000,"height":3000,"camera":"FUJIFILM X-T4","gps":true}
+{"type":"end","matched":1,"truncated":true,"found":1311,"unsupported":0,"unreadable":0}
+```
+
+Each run ends with one `end` or one `error` line. Matches come in their final order. `date` is the date that `--date` and `--sort date` use: `taken` from EXIF, else the time the file changed. `taken` and `date` are local time. `modified` is UTC. A path that is not UTF-8 also comes as base64 in `path_bytes`. The exit status is 0 when the run ends, also with no match, and 2 on an error. New fields, types and codes can come in later versions, so ignore the ones you do not know. To pass a query that starts with `-`, write `--query=TEXT`.
 
 ## How it works
 
