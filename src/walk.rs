@@ -40,7 +40,7 @@ pub struct WalkOpts {
 pub enum Found {
     Image(PathBuf),
     /// An image in a format that scry cannot read.
-    Unsupported,
+    Unsupported(PathBuf),
     /// A file or directory that scry cannot read.
     Error {
         path: Option<PathBuf>,
@@ -53,7 +53,7 @@ impl Found {
         if decode::is_image(path) {
             Some(Found::Image(path.to_path_buf()))
         } else if decode::is_unsupported(path) {
-            Some(Found::Unsupported)
+            Some(Found::Unsupported(path.to_path_buf()))
         } else {
             None
         }
@@ -422,7 +422,7 @@ mod tests {
             let found = found(source, opts(globs));
             found
                 .iter()
-                .filter(|f| matches!(f, Found::Unsupported))
+                .filter(|f| matches!(f, Found::Unsupported(_)))
                 .count()
         };
         assert_eq!(unsupported(paths(vec![root.to_path_buf()]), &[]), 2);
