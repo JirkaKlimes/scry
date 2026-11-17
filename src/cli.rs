@@ -43,9 +43,10 @@ const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(20).unwrap();
     group(ArgGroup::new("rank").args(["query", "like"])),
     group(ArgGroup::new("view").args(["scatter", "grid"])),
     after_help = format!("\
-RANGE is A..B, A.., ..B or A. Both ends are inclusive. A date (2024, 2024-06, 2024-06-15) covers \
-the whole period. An age (12h, 7d, 2w, 3mo, 1y) counts back from now: --date 7d.. is the last 7 \
-days, ..1y is older than a year.
+RANGE is A..B, A.., ..B or A. Both ends are inclusive. A date covers its last part: 2024 is a \
+year, 2024-06-15T14 is an hour. An offset (Z, +02:00) turns a date into local time. An age (15m, \
+1h30m, 7d, 3mo, 1y) counts back from now: --date 7d is the last 7 days, ..1y is older than a \
+year. The words today and yesterday mean calendar days.
 
 Environment:
   SCRY_CACHE   Directory for the models and the cache
@@ -587,7 +588,8 @@ mod tests {
             ErrorKind::ArgumentConflict
         );
         assert_eq!(err(&["--width", "big"]), ErrorKind::ValueValidation);
-        assert_eq!(err(&["--date", "7d"]), ErrorKind::ValueValidation);
+        assert_eq!(err(&["--date", "7"]), ErrorKind::ValueValidation);
+        assert!(parse(&["--date", "7d"]).is_ok());
         assert_eq!(err(&["-t", "a[b"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--camera", "("]), ErrorKind::ValueValidation);
         assert_eq!(err(&["-g", "a[b"]), ErrorKind::ValueValidation);

@@ -28,7 +28,7 @@ use crate::{
 
 /// Part of the file name. Each version keeps its own file, so two scry versions on one computer
 /// never delete each other's cache.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const META: Def<MetaRow> = TableDefinition::new("meta");
 const OCR: Def<String> = TableDefinition::new(ocr::ID);
 const IMAGES: Def<Embedding> = TableDefinition::new(embed::IMAGE_ID);
