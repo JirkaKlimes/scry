@@ -24,6 +24,7 @@ use crate::{
     meta::{Exif, Meta},
     ocr,
     output::clean_path,
+    report::{self, Code},
 };
 
 /// Part of the file name. Each version keeps its own file, so two scry versions on one computer
@@ -128,7 +129,9 @@ impl Cache {
             open_or_replace(&path).with_context(|| clean_path(&path).to_string())
         });
         let db = db
-            .inspect_err(|e| eprintln!("scry: running without a cache: {e:#}"))
+            .inspect_err(|e| {
+                report::warn(Code::NoCache, &format!("running without a cache: {e:#}"))
+            })
             .ok();
         Ok(Self::new(db))
     }

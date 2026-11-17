@@ -17,7 +17,7 @@ use crate::{
     cache, decode,
     embed::{self, Prompt},
     meta::{self, MetaFilter, Range},
-    output::{self, End, ListOpts, clean_path},
+    output::{self, End, ListOpts, Out, Shown, clean_path},
     pick::{Bind, View},
     search::{By, Dir, Field, Order, Query, Rank, Scoring},
     walk::{self, Source, WalkOpts},
@@ -207,6 +207,10 @@ struct Args {
     /// Separate paths with NUL instead of newline, on stdin and stdout
     #[arg(short = '0', long, help_heading = "Output")]
     null: bool,
+
+    /// Print JSON Lines for programs: the progress, each image with its metadata, and the end
+    #[arg(long, conflicts_with_all = ["preview", "score"], help_heading = "Output")]
+    json: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -222,12 +226,33 @@ enum Limit {
     First(NonZeroUsize),
 }
 
-pub fn parse() -> (Query, Mode) {
-    Args::parse().split().unwrap_or_else(|e| e.exit())
+pub fn parse() -> Result<(Query, Mode), clap::Error> {
+    Args::try_parse()?.split()
+}
+
+/// The message of a usage error, without the usage block that clap adds. clap also tells to put
+/// a value that starts with - after `--`, but scry reads the arguments after `--` as paths.
+pub fn message(e: &clap::Error) -> String {
+    let text = e.to_string();
+    let text = text.strip_prefix("error: ").unwrap_or(&text);
+    (text.split("\n\n"))
+        .take_while(|part| !part.starts_with("Usage:"))
+        .filter(|part| !part.starts_with("  tip: to pass '"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim_end()
+        .to_owned()
 }
 
 impl Args {
     fn split(self) -> Result<(Query, Mode), clap::Error> {
+        // A program that starts scry often leaves stdin open, and scry would wait for it.
+        if self.json && self.paths.is_empty() {
+            return Err(Args::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "--json needs a PATH, or - to read the paths on stdin",
+            ));
+        }
         check_paths(&self.paths, self.query.as_deref())?;
         if let Some(like) = &self.like {
             check_like(like)?;
@@ -256,10 +281,28 @@ impl Args {
                 camera: self.camera,
                 gps: (self.gps || self.no_gps).then_some(self.gps),
             },
-            text,
             show_text: self.show_text,
+            describe: self.json,
             limit: limit_or_default(self.limit, &order, view.is_some()),
             order,
+            text,
+        };
+        let out = if self.json {
+            Out::Json {
+                matches: !query.text.is_empty(),
+            }
+        } else {
+            let shown = match (self.show_text, query.text.is_empty()) {
+                (false, _) => Shown::Nothing,
+                (true, true) => Shown::Text,
+                (true, false) => Shown::Matches,
+            };
+            Out::Lines {
+                score: self.score,
+                preview: self.preview,
+                shown,
+                end,
+            }
         };
         let mode = match view {
             Some(view) => Mode::Pick {
@@ -268,9 +311,11 @@ impl Args {
                 end,
             },
             None => Mode::List(ListOpts {
-                score: self.score,
-                preview: self.preview,
-                end,
+                out,
+                cut: query
+                    .limit
+                    .filter(|_| self.limit.is_none())
+                    .map(NonZeroUsize::get),
             }),
         };
         Ok((query, mode))
@@ -738,7 +783,18 @@ mod tests {
             Order::Ranked(Scoring { rank: Rank::Text { query, not }, min: None, embeddings: false }, ..)
                 if query.as_str() == "receipt" && not.is_empty()
         ));
-        assert!(matches!(mode, Mode::List(o) if o.end == End::Nul && o.score && !o.preview));
+        assert!(matches!(
+            mode,
+            Mode::List(ListOpts {
+                out: Out::Lines {
+                    score: true,
+                    preview: false,
+                    shown: Shown::Nothing,
+                    end: End::Nul
+                },
+                cut: Some(20),
+            })
+        ));
 
         let (q, mode) = parse(&["-t", "Total", "-s", "-0", "src"]).unwrap();
         assert!(!q.text[0].is_match("TOTAL"));
@@ -785,6 +841,31 @@ mod tests {
                 ..
             )
         ));
+    }
+
+    #[test]
+    fn json_output() {
+        let (q, mode) = parse(&["--json", "-t", "x", "-o", "src"]).unwrap();
+        assert!(q.describe && q.show_text);
+        assert!(matches!(
+            mode,
+            Mode::List(ListOpts {
+                out: Out::Json { matches: true },
+                cut: None
+            })
+        ));
+        assert_eq!(err(&["--json"]), ErrorKind::MissingRequiredArgument);
+        assert!(parse(&["--json", "-"]).is_ok());
+        assert_eq!(err(&["--json", "-p", "src"]), ErrorKind::ArgumentConflict);
+        let e = Args::try_parse_from(["scry", "--order", "newest"])
+            .err()
+            .unwrap();
+        assert_eq!(message(&e), "unexpected argument '--order' found");
+        let e = Args::try_parse_from(["scry", "--hiden"]).err().unwrap();
+        assert_eq!(
+            message(&e),
+            "unexpected argument '--hiden' found\n\n  tip: a similar argument exists: '--hidden'"
+        );
     }
 
     #[test]

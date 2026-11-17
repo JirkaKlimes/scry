@@ -7,6 +7,7 @@ mod models;
 mod ocr;
 mod output;
 mod pick;
+mod report;
 mod search;
 #[cfg(test)]
 mod testing;
@@ -15,6 +16,7 @@ mod walk;
 use std::{
     any::Any,
     cell::Cell,
+    env,
     panic::{self, AssertUnwindSafe},
     process::ExitCode,
     sync::{
@@ -34,12 +36,22 @@ use signal_hook::{
 use cache::Cache;
 use cli::Mode;
 use pick::Exit;
+use report::{Fault, Format, Summary};
 
 fn main() -> ExitCode {
+    report::init(if wants_json() {
+        Format::Json
+    } else {
+        Format::Text
+    });
     let code = match run() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("scry: {e:#}");
+            let fault = match e.downcast_ref::<models::Failed>() {
+                Some(_) => Fault::Download,
+                None => Fault::Other,
+            };
+            report::error(fault, &format!("{e:#}"));
             ExitCode::from(2)
         }
     };
@@ -47,32 +59,51 @@ fn main() -> ExitCode {
     code
 }
 
+/// Before clap parses the arguments, so that its errors also come as JSON.
+fn wants_json() -> bool {
+    (env::args_os().skip(1))
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json")
+}
+
 fn run() -> Result<ExitCode> {
-    let (query, mode) = cli::parse();
+    let (query, mode) = match cli::parse() {
+        Ok(parsed) => parsed,
+        // Help and version.
+        Err(e) if !e.use_stderr() => e.exit(),
+        Err(e) => {
+            report::error(Fault::Usage, &cli::message(&e));
+            return Ok(ExitCode::from(2));
+        }
+    };
     hide_guarded_panics();
     let search = search::run(query)?;
     let (progress, skipped) = (search.progress.clone(), search.skipped);
-    let printed = match mode {
-        Mode::List(opts) => Some(output::list(search, &opts)? > 0),
+    let (matched, cut, quit) = match mode {
+        Mode::List(opts) => (output::list(search, &opts.out)?, opts.cut, false),
         Mode::Pick { view, binds, end } => match pick::run(search, view, binds)? {
             Exit::Picked(paths) => {
                 output::paths(&paths, end)?;
-                Some(true)
+                (paths.len(), None, false)
             }
-            Exit::Empty => Some(false),
-            Exit::Aborted => None,
+            Exit::Empty => (0, None, false),
+            Exit::Aborted => (0, None, true),
         },
     };
-    output::notes(&progress, skipped);
-    let Some(printed) = printed else {
-        return Ok(ExitCode::from(130));
-    };
-    Ok(if printed {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    report::end(&Summary {
+        progress: &progress,
+        matched,
+        skipped,
+        cut,
+    });
+    Ok(match (quit, matched) {
+        (true, _) => ExitCode::from(130),
+        // A program reads the count in the end line.
+        (false, 0) if !report::json() => ExitCode::FAILURE,
+        _ => ExitCode::SUCCESS,
     })
 }
+
 /// A stopped scry keeps the work since the last cache commit and leaves the terminal as it was.
 /// Then it dies by the same signal, so that a shell loop that gets Ctrl-C also stops.
 pub fn stop_on_signals(cache: Arc<Cache>) -> Result<()> {
@@ -86,7 +117,6 @@ pub fn stop_on_signals(cache: Arc<Cache>) -> Result<()> {
     });
     Ok(())
 }
-
 
 thread_local! {
     static GUARDS: Cell<usize> = const { Cell::new(0) };

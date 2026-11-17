@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::{self, File, TryLockError},
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -7,12 +8,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use indicatif::{DecimalBytes, ProgressBar, ProgressStyle};
+use indicatif::DecimalBytes;
 use rten::Model;
 use sha2::{Digest, Sha256};
 use ureq::http::StatusCode;
 
-use crate::{cache, output::clean_path};
+use crate::{cache, output::clean_path, report::Download};
 
 pub struct Asset {
     /// For people, like "SigLIP 2 image model".
@@ -40,42 +41,48 @@ pub fn fetch(asset: &Asset) -> Result<PathBuf> {
         .write(true)
         .truncate(false)
         .open(&part)?;
-    let bar = progress(asset)?;
+    let progress = Download::new(asset.label, asset.size);
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
-            eprintln!(
-                "scry: waiting for another scry to download the {}",
+            progress.note(&format!(
+                "waiting for another scry to download the {}",
                 asset.label
-            );
-            wait_for_lock(&file, &bar)?;
+            ));
+            wait_for_lock(&file, &progress)?;
         }
         Err(TryLockError::Error(e)) => return Err(e.into()),
     }
     if path.exists() {
         let _ = fs::remove_file(&part);
     } else {
-        // Also without a terminal, where the bar does not show, so a log tells why a run is slow.
-        bar.suspend(|| {
-            eprintln!(
-                "scry: downloading the {} ({}) to {}. Later runs use this copy.",
-                asset.label,
-                DecimalBytes(asset.size),
-                clean_path(&dir)
-            )
-        });
-        download(asset, &mut file, &bar)
-            .with_context(|| format!("cannot download the {}", asset.label))?;
+        progress.note(&format!(
+            "downloading the {} ({}) to {}. Later runs use this copy.",
+            asset.label,
+            DecimalBytes(asset.size),
+            clean_path(&dir)
+        ));
+        download(asset, &mut file, &progress).context(Failed(asset.label))?;
         fs::rename(&part, &path)?;
     }
-    bar.finish_and_clear();
+    progress.finish();
     Ok(path)
 }
 
+/// A failed download, which the JSON error line tells apart.
+#[derive(Debug)]
+pub struct Failed(&'static str);
+
+impl fmt::Display for Failed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "cannot download the {}", self.0)
+    }
+}
+
 /// Shows the progress of the scry that holds the lock, from the size of its file.
-fn wait_for_lock(file: &File, bar: &ProgressBar) -> Result<()> {
+fn wait_for_lock(file: &File, progress: &Download) -> Result<()> {
     loop {
-        bar.set_position(file.metadata()?.len());
+        progress.set(file.metadata()?.len());
         thread::sleep(Duration::from_millis(100));
         match file.try_lock() {
             Ok(()) => return Ok(()),
@@ -107,7 +114,7 @@ pub fn cannot_load(path: &Path) -> String {
 }
 
 /// Continues from the bytes that an earlier run wrote, if the server can send the rest.
-fn download(asset: &Asset, file: &mut File, bar: &ProgressBar) -> Result<()> {
+fn download(asset: &Asset, file: &mut File, progress: &Download) -> Result<()> {
     let mut hasher = Sha256::new();
     let mut done = copy_hashed(&*file, io::sink(), &mut hasher)?;
     if done < asset.size {
@@ -121,9 +128,9 @@ fn download(asset: &Asset, file: &mut File, bar: &ProgressBar) -> Result<()> {
             hasher = Sha256::new();
             done = 0;
         }
-        bar.set_position(done);
+        progress.set(done);
         copy_hashed(
-            bar.wrap_read(resp.body_mut().as_reader()),
+            progress.read(resp.body_mut().as_reader()),
             &*file,
             &mut hasher,
         )?;
@@ -151,14 +158,6 @@ fn agent() -> ureq::Agent {
         .timeout_per_read(Some(Duration::from_secs(60)))
         .build()
         .into()
-}
-
-fn progress(asset: &Asset) -> Result<ProgressBar> {
-    let style =
-        ProgressStyle::with_template("{msg} {bar:30} {decimal_bytes}/{decimal_total_bytes} {eta}")?;
-    Ok(ProgressBar::new(asset.size)
-        .with_style(style)
-        .with_message(asset.label))
 }
 
 /// Returns the number of bytes.
