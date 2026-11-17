@@ -1,7 +1,9 @@
 use std::{
     cmp::Ordering,
     collections::HashSet,
-    fmt, fs, iter,
+    fmt,
+    fs::{self, Metadata},
+    iter,
     num::NonZeroUsize,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -630,7 +632,7 @@ impl Engine {
             Order::Found => {
                 for chunk in ready_chunks(&paths, self.text_chunk()) {
                     let n = chunk.len();
-                    let cands = self.read_text(self.admit_new(chunk, false, &mut seen));
+                    let cands = self.read_text(self.admit(chunk, false, Some(&mut seen)));
                     self.progress.done.fetch_add(n, Relaxed);
                     if !self.emit(cands, sink) {
                         // Images that wait in the walk are not checked.
@@ -642,8 +644,9 @@ impl Engine {
             }
             Order::Sorted(field, dir) => {
                 let dated = *field == Field::Date;
-                let mut cands =
-                    self.gather(&paths, |chunk| Ok(self.admit_new(chunk, dated, &mut seen)))?;
+                let mut cands = self.gather(&paths, |chunk| {
+                    Ok(self.admit(chunk, dated, Some(&mut seen)))
+                })?;
                 cands.sort_by(|a, b| compare(By::Field(*field), *dir, a, b));
                 self.send_sorted(cands, sink);
             }
@@ -651,7 +654,7 @@ impl Engine {
                 self.progress.enter(Stage::Score, 0);
                 let dated = *by == By::Field(Field::Date);
                 let scored = self.gather(&paths, |chunk| {
-                    self.rank(ranker, self.admit_new(chunk, dated, &mut seen))
+                    self.rank(ranker, self.admit(chunk, dated, Some(&mut seen)))
                 })?;
                 let best = best_first(scored);
                 if (*by, *dir) == (By::Score, Dir::Natural) {
@@ -678,7 +681,7 @@ impl Engine {
         let size = self.text_chunk();
         for chunk in ready_chunks(live, size) {
             let n = chunk.len();
-            let mut cands = self.admit(chunk, false);
+            let mut cands = self.admit(chunk, false, None);
             if let Some(emitted) = &self.emitted {
                 let emitted = emitted.lock().unwrap();
                 cands.retain(|c| !emitted.contains(&(c.id, c.born)));
@@ -805,27 +808,43 @@ impl Engine {
     }
 
     /// `dated` reads the metadata for a date even without a metadata filter.
-    fn admit(&self, paths: Vec<PathBuf>, dated: bool) -> Vec<Cand> {
-        let view = self.cache.view();
-        (paths.into_par_iter())
+    /// `seen` drops the files that came before: overlapping paths find a file twice. It comes
+    /// before any check that can fail, so a failure counts once, and the first path wins.
+    fn admit(
+        &self,
+        paths: Vec<PathBuf>,
+        dated: bool,
+        seen: Option<&mut HashSet<FileId>>,
+    ) -> Vec<Cand> {
+        let mut files: Vec<(PathBuf, Metadata)> = (paths.into_par_iter())
             .filter_map(|path| {
-                self.ok(&path, self.admit_one(&view, &path, dated))
+                let md = self.ok(&path, fs::metadata(&path).map_err(Into::into))?;
+                Some((path, md))
+            })
+            .collect();
+        if let Some(seen) = seen {
+            let found = files.len();
+            files.retain(|(_, md)| seen.insert((md.dev(), md.ino())));
+            self.progress.found.fetch_sub(found - files.len(), Relaxed);
+        }
+        let view = self.cache.view();
+        (files.into_par_iter())
+            .filter_map(|(path, md)| {
+                self.ok(&path, self.admit_one(&view, &path, &md, dated))
                     .flatten()
             })
             .collect()
     }
 
-    /// Overlapping paths find a file twice. The first path wins, so threads do not decide.
-    fn admit_new(&self, paths: Vec<PathBuf>, dated: bool, seen: &mut HashSet<FileId>) -> Vec<Cand> {
-        let mut cands = self.admit(paths, dated);
-        cands.retain(|c| seen.insert(c.id));
-        cands
-    }
-
-    fn admit_one(&self, view: &View, path: &Path, dated: bool) -> Result<Option<Cand>> {
-        let md = fs::metadata(path)?;
-        decode::check(&md)?;
-        let key = Key::new(path, &md);
+    fn admit_one(
+        &self,
+        view: &View,
+        path: &Path,
+        md: &Metadata,
+        dated: bool,
+    ) -> Result<Option<Cand>> {
+        decode::check(md)?;
+        let key = Key::new(path, md);
         let modified = md.modified()?;
         let mut meta = None;
         if dated || self.filter.needs_meta() {
