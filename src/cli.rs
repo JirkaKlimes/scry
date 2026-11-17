@@ -133,7 +133,13 @@ struct Args {
     height: Option<Range<u32>>,
 
     /// Date the photo was taken (EXIF), else the time the file changed
-    #[arg(long, value_name = "RANGE", value_parser = meta::time_range, help_heading = "Metadata")]
+    #[arg(
+        long,
+        value_name = "RANGE",
+        value_parser = meta::time_range,
+        allow_hyphen_values = true,
+        help_heading = "Metadata"
+    )]
     date: Option<Range<DateTime>>,
 
     /// Camera make and model, for example 'fujifilm x-t4'
@@ -193,7 +199,12 @@ struct Args {
 
     /// Sort by KEY: score (best first), date (newest first) or path (A to Z) [default: score with -q
     /// or -l, else the order scry finds the images]
-    #[arg(long, value_name = "KEY", hide_possible_values = true, help_heading = "Output")]
+    #[arg(
+        long,
+        value_name = "KEY",
+        hide_possible_values = true,
+        help_heading = "Output"
+    )]
     sort: Option<SortKey>,
 
     /// Reverse the order
@@ -698,6 +709,8 @@ mod tests {
         assert_eq!(err(&["--width", "big"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--date", "7"]), ErrorKind::ValueValidation);
         assert!(parse(&["--date", "7d"]).is_ok());
+        let e = parse(&["--date", "-7d"]).err().unwrap();
+        assert!(message(&e).contains("an age has no sign"), "{e}");
         assert_eq!(err(&["-t", "a[b"]), ErrorKind::ValueValidation);
         assert_eq!(err(&["--camera", "("]), ErrorKind::ValueValidation);
         assert_eq!(err(&["-g", "a[b"]), ErrorKind::ValueValidation);
