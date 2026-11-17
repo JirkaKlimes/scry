@@ -1,7 +1,7 @@
 //! For --watch: after the walk, scry keeps watching the directories and sends each new image.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::ErrorKind::{NotFound, PermissionDenied},
     os::unix::fs::MetadataExt,
@@ -51,6 +51,9 @@ pub struct Dirs {
     /// The system limit of watches is reached. The warning shows once, because every directory
     /// after it fails too.
     full: Arc<AtomicBool>,
+    /// macOS also reports a directory when a file in it changes. Only a directory that is not
+    /// here yet is new.
+    known: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl Dirs {
@@ -60,11 +63,13 @@ impl Dirs {
         let dirs = Self {
             watcher: Arc::new(Mutex::new(watcher)),
             full: Arc::default(),
+            known: Arc::default(),
         };
         Ok((dirs, events))
     }
 
     pub fn root(&self, dir: &Path) {
+        self.known.lock().unwrap().insert(dir.to_path_buf());
         let mode = if cfg!(target_os = "macos") {
             RecursiveMode::Recursive
         } else {
@@ -73,11 +78,23 @@ impl Dirs {
         self.watch(dir, mode);
     }
 
-    /// A directory below a root.
-    pub fn add(&self, dir: &Path) {
+    /// A directory below a root. False if it has a watch already.
+    pub fn add(&self, dir: &Path) -> bool {
+        if !self.known.lock().unwrap().insert(dir.to_path_buf()) {
+            return false;
+        }
         if !cfg!(target_os = "macos") {
             self.watch(dir, RecursiveMode::NonRecursive);
         }
+        true
+    }
+
+    /// A directory that is gone, with the ones below it. A new one at its path needs a watch.
+    fn forget(&self, dir: &Path) {
+        self.known
+            .lock()
+            .unwrap()
+            .retain(|known| !known.starts_with(dir));
     }
 
     fn watch(&self, dir: &Path, mode: RecursiveMode) {
@@ -194,6 +211,15 @@ impl Follower {
     }
 
     fn note(&self, event: &Event, due: &mut HashMap<PathBuf, (usize, Instant)>) {
+        if let EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) =
+            event.kind
+        {
+            for path in &event.paths {
+                if let Some((_, path)) = self.local(path) {
+                    self.dirs.forget(&path);
+                }
+            }
+        }
         let Some(after) = settle(&event.kind) else {
             return;
         };
@@ -251,9 +277,9 @@ impl Follower {
         }
         if md.is_dir() {
             // Watch first, so the scan sees each file that comes before the watch. A directory
-            // that moves in keeps the change times of its files, so they all count.
-            self.dirs.add(path);
-            return self.scan(path, &below, false);
+            // that moves in keeps the change times of its files, so they all count. The files of
+            // a known directory tell about themselves.
+            return !self.dirs.add(path) || self.scan(path, &below, false);
         }
         // An empty file is a placeholder that a writer fills later.
         if !md.is_file() || md.len() == 0 {
