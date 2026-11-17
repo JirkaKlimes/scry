@@ -122,7 +122,7 @@ OCR can read words in an unexpected order, or read a letter wrong. Use `-o` to s
 scry skips hidden files, the paths in `.gitignore`, and the Photos library of macOS. Use `--hidden` and `--no-ignore`, or give the path of the library.
 
 **How do I clear the cache, or use scry without internet?**
-Delete `cache.redb` in the cache directory. For a computer without internet, copy the `models` directory from the cache directory of another computer.
+Delete the `cache-v*.redb` files in the cache directory. For a computer without internet, copy the `models` directory from the cache directory of another computer.
 
 ## Credits
 

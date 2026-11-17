@@ -16,7 +16,7 @@ use anyhow::{Context, Result, ensure};
 use half::f16;
 use redb::{
     ConcurrencyMode, Database, DatabaseError, ReadOnlyTable, ReadTransaction, ReadableDatabase,
-    StorageError, TableDefinition, TableError, Value, WriteTransaction, backends::FileBackend,
+    StorageError, TableDefinition, Value, WriteTransaction, backends::FileBackend,
 };
 
 use crate::{
@@ -26,8 +26,9 @@ use crate::{
     output::clean_path,
 };
 
+/// Part of the file name. Each version keeps its own file, so two scry versions on one computer
+/// never delete each other's cache.
 const VERSION: u32 = 4;
-const SCHEMA: TableDefinition<(), u32> = TableDefinition::new("schema");
 const META: Def<MetaRow> = TableDefinition::new("meta");
 const OCR: Def<String> = TableDefinition::new(ocr::ID);
 const IMAGES: Def<Embedding> = TableDefinition::new(embed::IMAGE_ID);
@@ -123,7 +124,7 @@ impl Cache {
     pub fn open() -> Result<Self> {
         let dir = location(env::var_os("SCRY_CACHE"))?;
         let db = create(&dir).and_then(|()| {
-            let path = dir.join("cache.redb");
+            let path = dir.join(format!("cache-v{VERSION}.redb"));
             open_or_replace(&path).with_context(|| clean_path(&path).to_string())
         });
         let db = db
@@ -351,13 +352,13 @@ fn location(var: Option<OsString>) -> Result<PathBuf> {
     }
 }
 
-/// Replaces a file with another schema, another redb format, or no redb database.
+/// Replaces a file with another redb format, or no redb database.
 fn open_or_replace(path: &Path) -> Result<Database> {
     if let Some(db) = open_db(path)? {
         return Ok(db);
     }
     fs::remove_file(path)?;
-    open_db(path)?.context("cache was replaced by another scry version")
+    open_db(path)?.context("cannot replace an unusable cache")
 }
 
 fn open_db(path: &Path) -> Result<Option<Database>> {
@@ -374,26 +375,11 @@ fn open_db(path: &Path) -> Result<Option<Database>> {
         .set_cache_size(CACHE_SIZE)
         .set_concurrency_mode(ConcurrencyMode::MultiWriter)
         .create_with_backend(FileBackend::new(file)?);
-    let db = match opened {
-        Ok(db) => db,
-        Err(e) if unusable(&e) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let version = match db.begin_read()?.open_table(SCHEMA) {
-        Ok(table) => table.get(())?.map(|v| v.value()),
-        Err(TableError::TableDoesNotExist(_)) => None,
-        Err(e) => return Err(e.into()),
-    };
-    match version {
-        Some(VERSION) => {}
-        Some(_) => return Ok(None),
-        None => {
-            let tx = db.begin_write()?;
-            tx.open_table(SCHEMA)?.insert((), VERSION)?;
-            tx.commit()?;
-        }
+    match opened {
+        Ok(db) => Ok(Some(db)),
+        Err(e) if unusable(&e) => Ok(None),
+        Err(e) => Err(e.into()),
     }
-    Ok(Some(db))
 }
 
 /// A bad file signature or a truncated header comes back as an I/O error.
@@ -529,33 +515,6 @@ mod tests {
         let view = cache.view();
         assert!(view.ocr(&key, || anyhow::bail!("corrupt")).is_err());
         assert_eq!(view.ocr(&key, || Ok("ok".into())).unwrap(), "ok");
-    }
-
-    #[test]
-    fn other_schema_is_replaced() {
-        let dir = Temp::dir("schema");
-        let key = file(&dir, "a.jpg", "a");
-        {
-            let cache = open(&dir);
-            cache.view().ocr(&key, || Ok("old".into())).unwrap();
-            let tx = cache.db.as_ref().unwrap().begin_write().unwrap();
-            tx.open_table(SCHEMA)
-                .unwrap()
-                .insert((), VERSION + 1)
-                .unwrap();
-            tx.commit().unwrap();
-        }
-        let cache = open(&dir);
-        assert_eq!(cache.view().ocr(&key, || Ok("new".into())).unwrap(), "new");
-        let tx = cache.db.as_ref().unwrap().begin_read().unwrap();
-        let version = tx
-            .open_table(SCHEMA)
-            .unwrap()
-            .get(())
-            .unwrap()
-            .unwrap()
-            .value();
-        assert_eq!(version, VERSION);
     }
 
     #[test]
