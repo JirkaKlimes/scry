@@ -16,7 +16,7 @@ mod walk;
 use std::{
     any::Any,
     cell::Cell,
-    env,
+    env, io,
     panic::{self, AssertUnwindSafe},
     process::ExitCode,
     sync::{
@@ -110,6 +110,9 @@ pub fn stop_on_signals(cache: Arc<Cache>) -> Result<()> {
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
     thread::spawn(move || {
         if let Some(signal) = signals.forever().next() {
+            // The picker draws nothing more while this holds stdout. A list holds stdout for the
+            // whole run, so only the picker gets this lock.
+            let _picker = pick::active().then(|| io::stdout().lock());
             cache.flush();
             pick::restore();
             let _ = emulate_default_handler(signal);

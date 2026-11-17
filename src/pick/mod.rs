@@ -207,8 +207,8 @@ struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        ACTIVE.store(false, Relaxed);
         ratatui::restore();
+        ACTIVE.store(false, Relaxed);
     }
 }
 
