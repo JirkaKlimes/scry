@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     env, fs,
+    io::ErrorKind::{NotFound, PermissionDenied},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
@@ -47,8 +48,9 @@ const WRITING: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct Dirs {
     watcher: Arc<Mutex<RecommendedWatcher>>,
-    /// Only the first failure shows: past the system limit, every directory fails.
-    failed: Arc<AtomicBool>,
+    /// The system limit of watches is reached. The warning shows once, because every directory
+    /// after it fails too.
+    full: Arc<AtomicBool>,
 }
 
 impl Dirs {
@@ -57,7 +59,7 @@ impl Dirs {
         let watcher = RecommendedWatcher::new(tx, notify::Config::default())?;
         let dirs = Self {
             watcher: Arc::new(Mutex::new(watcher)),
-            failed: Arc::default(),
+            full: Arc::default(),
         };
         Ok((dirs, events))
     }
@@ -82,14 +84,18 @@ impl Dirs {
         let Err(e) = self.watcher.lock().unwrap().watch(dir, mode) else {
             return;
         };
-        if self.failed.swap(true, Relaxed) {
-            return;
-        }
         let why = match e.kind {
+            // The walk tells about a directory that it cannot read. One that is gone needs no
+            // watch.
+            notify::ErrorKind::PathNotFound | notify::ErrorKind::WatchNotFound => return,
+            notify::ErrorKind::Io(e) if matches!(e.kind(), NotFound | PermissionDenied) => return,
+            notify::ErrorKind::MaxFilesWatch if self.full.swap(true, Relaxed) => return,
             notify::ErrorKind::MaxFilesWatch => {
                 "the system limit is reached. Raise fs.inotify.max_user_watches.".into()
             }
-            _ => e.to_string(),
+            notify::ErrorKind::Io(e) => e.to_string(),
+            notify::ErrorKind::Generic(text) => text,
+            notify::ErrorKind::InvalidConfig(config) => format!("{config:?}"),
         };
         let message = format!("cannot watch {} for new images: {why}", clean_path(dir));
         report::warn(Code::Unwatched, &message);
