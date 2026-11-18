@@ -51,6 +51,7 @@ pub struct Query {
 
 /// A sorted order sends the first hit only after it has seen all images. `S` is what a score
 /// needs at each stage: the query, the loaded model, or nothing.
+#[derive(Clone, Copy)]
 pub enum Order<S = Scoring> {
     /// The walk order, or the order of the paths on stdin.
     Found,
@@ -78,6 +79,28 @@ pub enum By {
 pub enum Dir {
     Natural,
     Reverse,
+}
+
+impl<S> Order<S> {
+    /// The key and the direction of a sorted order. None keeps the order in which hits come.
+    fn key(&self) -> Option<(By, Dir)> {
+        match self {
+            Order::Found => None,
+            Order::Sorted(field, dir) => Some((By::Field(*field), *dir)),
+            Order::Ranked(_, by, dir) => Some((*by, *dir)),
+        }
+    }
+
+    pub fn dated(&self) -> bool {
+        self.key()
+            .is_some_and(|(by, _)| by == By::Field(Field::Date))
+    }
+
+    /// True when `a` goes before `b`. In walk order, a hit that comes later goes later.
+    pub fn before(&self, a: &Hit, b: &Hit) -> bool {
+        self.key()
+            .is_none_or(|(by, dir)| compare(by, dir, &a.keys(), &b.keys()).is_lt())
+    }
 }
 
 pub struct Scoring {
@@ -137,6 +160,17 @@ pub struct FileInfo {
     /// None if scry cannot read the header.
     pub meta: Option<Meta>,
     pub modified: SystemTime,
+}
+
+impl Hit {
+    /// Without `describe`, a hit has no date.
+    fn keys(&self) -> Keys<'_> {
+        Keys {
+            score: self.score,
+            date: self.file.as_ref().and_then(FileInfo::date),
+            path: &self.path,
+        }
+    }
 }
 
 impl FileInfo {
@@ -630,8 +664,12 @@ struct Cand {
 }
 
 impl Cand {
-    fn date(&self) -> Option<DateTime> {
-        meta::date_of(self.meta.as_ref(), self.modified)
+    fn keys(&self) -> Keys<'_> {
+        Keys {
+            score: self.hit.score,
+            date: meta::date_of(self.meta.as_ref(), self.modified),
+            path: &self.hit.path,
+        }
     }
 }
 
@@ -665,7 +703,7 @@ impl Engine {
                 let mut cands = self.gather(&paths, |chunk| {
                     Ok(self.admit(chunk, dated, Some(&mut seen)))
                 })?;
-                cands.sort_by(|a, b| compare(By::Field(*field), *dir, a, b));
+                cands.sort_by(|a, b| compare(By::Field(*field), *dir, &a.keys(), &b.keys()));
                 self.send_sorted(cands, sink);
             }
             Order::Ranked(ranker, by, dir) => {
@@ -679,7 +717,7 @@ impl Engine {
                     self.send_sorted(best, sink);
                 } else {
                     let (mut set, left) = self.take(best, sink.left);
-                    set.sort_by(|a, b| compare(*by, *dir, a, b));
+                    set.sort_by(|a, b| compare(*by, *dir, &a.keys(), &b.keys()));
                     self.emit(set, sink);
                     self.stopped(sink, left);
                 }
@@ -972,18 +1010,25 @@ fn best_first(mut scored: Vec<(f32, Cand)>) -> Vec<Cand> {
         .collect()
 }
 
-fn compare(by: By, dir: Dir, a: &Cand, b: &Cand) -> Ordering {
-    let score = |c: &Cand| c.hit.score.unwrap_or(f32::NEG_INFINITY);
+/// What a sorted order compares.
+struct Keys<'a> {
+    score: Option<f32>,
+    date: Option<DateTime>,
+    path: &'a Path,
+}
+
+fn compare(by: By, dir: Dir, a: &Keys, b: &Keys) -> Ordering {
+    let score = |k: &Keys| k.score.unwrap_or(f32::NEG_INFINITY);
     let natural = match by {
         By::Score => score(b).total_cmp(&score(a)),
-        By::Field(Field::Date) => b.date().cmp(&a.date()),
-        By::Field(Field::Path) => a.hit.path.cmp(&b.hit.path),
+        By::Field(Field::Date) => b.date.cmp(&a.date),
+        By::Field(Field::Path) => a.path.cmp(b.path),
     };
     let order = match dir {
         Dir::Natural => natural,
         Dir::Reverse => natural.reverse(),
     };
-    order.then_with(|| a.hit.path.cmp(&b.hit.path))
+    order.then_with(|| a.path.cmp(b.path))
 }
 
 struct Sink {

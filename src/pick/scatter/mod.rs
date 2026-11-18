@@ -328,7 +328,8 @@ impl Scatter {
 }
 
 impl Board for Scatter {
-    fn push(&mut self, hit: Hit) {
+    /// A pile has no places, so `at` does not matter. A new image of --watch lands next.
+    fn push(&mut self, hit: Hit, _: usize) {
         if hit.live {
             self.feed.push_new(hit);
         } else {
