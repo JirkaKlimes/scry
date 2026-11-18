@@ -106,7 +106,7 @@ scry --grid --bind 'ctrl-d:cp -- "$@" ~/picked/' --bind 'ctrl-x:gio trash -- "$@
 scry --grid -q "a diagram" --bind 'ctrl-y:wl-copy < "$1"' ~/Documents
 ```
 
-With `--watch`, a new image lands on the pile next in scatter mode, and at the end in grid mode.
+With `--watch`, a new image lands on the pile next in scatter mode, and at its place in the order in grid mode.
 
 kitty, Ghostty, iTerm2, WezTerm, foot and other terminals with sixel support show full-resolution images, also in tmux. Other terminals get Unicode half blocks.
 

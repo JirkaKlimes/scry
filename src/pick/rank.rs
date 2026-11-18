@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -16,7 +17,7 @@ use crate::{
     embed::{ImageEmbedder, Prompt, TextEmbedder},
     guard,
     output::{clean, clean_path},
-    search::{Embedded, Hit, Search, Target},
+    search::{Embedded, Hit, Order, Search, Target},
 };
 
 /// While you type, new embeddings join the ranking at most this often, so the images do not
@@ -57,8 +58,13 @@ impl Images {
 /// Ranks the hits again inside a picker, by a text that you type or by an image. The search
 /// still chooses the hits: a ranking only changes their order.
 pub struct Ranking {
-    /// All hits, in the order and with the scores that the search gave them.
+    /// All hits, with the scores that the search gave them, in the order they came. An index
+    /// names a hit for good.
     hits: Vec<Hit>,
+    /// The indexes of `hits` in the order of the search. New images of --watch come after the
+    /// sort, so each hit goes to its place.
+    order: Vec<usize>,
+    by_path: HashMap<PathBuf, usize>,
     /// The probes that you gave, the newest last. Backspace goes back one.
     history: Vec<Probe>,
     /// The query line, while you type.
@@ -76,6 +82,8 @@ impl Ranking {
     pub fn new() -> Self {
         Self {
             hits: Vec::new(),
+            order: Vec::new(),
+            by_path: HashMap::new(),
             history: Vec::new(),
             typing: None,
             text: Model::Unloaded,
@@ -86,14 +94,32 @@ impl Ranking {
         }
     }
 
-    /// Takes a new hit from the search.
-    pub fn add(&mut self, hit: &Hit) {
+    /// Takes a new hit from the search, in `order`. Returns its place on the board: its place
+    /// in the search order, or last on a board that a probe ranks, until the next ranking.
+    pub fn add(&mut self, hit: Hit, order: &Order<()>) -> usize {
+        let i = self.hits.len();
         if hit.embedding.is_none()
             && let Some(images) = &mut self.images
         {
-            images.send(self.hits.len(), &hit.path);
+            images.send(i, &hit.path);
         }
-        self.hits.push(hit.clone());
+        let at = (self.order).partition_point(|&j| order.before(&self.hits[j], &hit));
+        self.order.insert(at, i);
+        self.by_path.insert(hit.path.clone(), i);
+        self.hits.push(hit);
+        if self.probing() {
+            self.fresh = true;
+            i
+        } else {
+            at
+        }
+    }
+
+    /// The hits at `paths`, as the search gave them.
+    pub fn hits(&self, paths: &[PathBuf]) -> Vec<Hit> {
+        (paths.iter())
+            .map(|path| self.hits[self.by_path[path]].clone())
+            .collect()
     }
 
     pub fn typing(&self) -> bool {
@@ -190,9 +216,16 @@ impl Ranking {
         self.stale = false;
         self.fresh = false;
         self.ranked = Instant::now();
+        let hits = self.order.iter().map(|&i| &self.hits[i]);
         Ok(Some(match target {
-            Some(target) => rank(&self.hits, &target),
-            None => self.hits.clone(),
+            Some(target) => rank(hits, &target),
+            // A board in a new order takes each image as one of the others.
+            None => hits
+                .map(|hit| Hit {
+                    live: false,
+                    ..hit.clone()
+                })
+                .collect(),
         }))
     }
 
@@ -249,7 +282,7 @@ impl Ranking {
     }
 
     fn embedding(&self, path: &Path) -> Option<Vec<f32>> {
-        let hit = self.hits.iter().find(|h| h.path == path)?;
+        let hit = &self.hits[*self.by_path.get(path)?];
         hit.embedding.as_deref().map(<[f32]>::to_vec)
     }
 
@@ -313,11 +346,11 @@ impl Ranking {
 
 /// The hits by `target`, best first. Equal scores go by path. Hits without an embedding keep
 /// their order, at the end.
-fn rank(hits: &[Hit], target: &Target) -> Vec<Hit> {
-    let mut ranked: Vec<Hit> = (hits.iter())
+fn rank<'a>(hits: impl Iterator<Item = &'a Hit>, target: &Target) -> Vec<Hit> {
+    let mut ranked: Vec<Hit> = hits
         .map(|hit| Hit {
             score: hit.embedding.as_deref().and_then(|e| target.score(e)),
-            // A ranking orders new images like the others.
+            // A board in a new order takes each image as one of the others.
             live: false,
             ..hit.clone()
         })
@@ -360,7 +393,7 @@ mod tests {
             hit("d", Some([1.0, 0.0])),
             hit("c", Some([1.0, 0.0])),
         ];
-        let ranked = rank(&hits, &Target::Like(vec![1.0, 0.0]));
+        let ranked = rank(hits.iter(), &Target::Like(vec![1.0, 0.0]));
         let order: Vec<_> = (ranked.iter())
             .map(|h| (h.path.to_str().unwrap(), h.score))
             .collect();
@@ -383,7 +416,7 @@ mod tests {
             hit("b", Some([0.0, 1.0])),
             hit("c", Some([0.6, 0.8])),
         ] {
-            ranking.add(&h);
+            ranking.add(h, &Order::Found);
         }
         assert!(ranking.poll().unwrap().is_none());
         ranking.like(Path::new("b"), &search).unwrap();
@@ -395,6 +428,43 @@ mod tests {
         let restored = ranking.poll().unwrap().unwrap();
         assert!(restored.iter().all(|h| h.score.is_none()));
         assert_eq!(names(Some(restored)), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_new_image_goes_to_its_place_in_the_search_order() {
+        use std::time::{Duration, SystemTime};
+
+        use crate::search::{Dir, Field, FileInfo};
+
+        let dated = |name: &str, secs: u64| Hit {
+            file: Some(FileInfo {
+                meta: None,
+                modified: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            }),
+            ..hit(name, Some([1.0, 0.0]))
+        };
+        let newest = Order::Sorted(Field::Date, Dir::Natural);
+        let mut ranking = Ranking::new();
+        assert_eq!(ranking.add(dated("b", 200), &newest), 0);
+        assert_eq!(ranking.add(dated("a", 100), &newest), 1);
+        let live = Hit {
+            live: true,
+            ..dated("new", 300)
+        };
+        assert_eq!(ranking.add(live, &newest), 0, "the newest image goes first");
+        assert_eq!(ranking.add(dated("mid", 150), &newest), 2);
+
+        ranking.history.push(Probe::Like("a".into()));
+        assert_eq!(
+            ranking.add(dated("late", 400), &newest),
+            4,
+            "a probe board takes it last"
+        );
+        ranking.back();
+        let restored = ranking.poll().unwrap();
+        assert_eq!(names(restored.clone()), ["late", "new", "b", "mid", "a"]);
+        assert!(restored.unwrap().iter().all(|h| !h.live));
+        assert_eq!(names(Some(ranking.hits(&["mid".into()]))), ["mid"]);
     }
 
     #[test]

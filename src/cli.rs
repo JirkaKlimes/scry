@@ -323,7 +323,8 @@ impl Args {
                 gps: (self.gps || self.no_gps).then_some(self.gps),
             },
             show_text: self.show_text,
-            describe: self.json,
+            // A picker places a new image of --watch by its date.
+            describe: self.json || (view.is_some() && order.dated()),
             limit: limit_or_default(self.limit, &order, view.is_some() || self.watch.is_some()),
             watch: self.watch,
             order,

@@ -137,8 +137,13 @@ impl Grid {
 }
 
 impl Board for Grid {
-    fn push(&mut self, hit: Hit) {
-        self.hits.push(hit);
+    /// The selection keeps its tile, so the page in view stays when a hit goes before it.
+    fn push(&mut self, hit: Hit, at: usize) {
+        if at < self.hits.len() {
+            // Sixel and iTerm2 images of the hits that move stay on screen without a clear.
+            self.shown = Scene::default();
+        }
+        self.hits.insert(at, hit);
     }
 
     fn clear(&mut self, _: &Order<()>) {

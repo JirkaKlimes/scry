@@ -7,7 +7,6 @@ mod scatter;
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
     fmt,
     io::{self, Write},
     mem,
@@ -273,8 +272,6 @@ struct Core {
     /// The area for images, above the status line.
     bounds: Rect,
     marks: Vec<PathBuf>,
-    /// The hits by path, so a pick returns their score and metadata.
-    found: HashMap<PathBuf, Hit>,
     zoom: Option<Zoom>,
     /// The kitty images that the frame in progress sends.
     transmits: RefCell<Vec<kitty::Transmit>>,
@@ -296,26 +293,9 @@ impl Core {
             searching: true,
             bounds: Rect::ZERO,
             marks: Vec::new(),
-            found: HashMap::new(),
             zoom: None,
             transmits: RefCell::default(),
         })
-    }
-
-    /// Gives each new hit to `push`.
-    fn drain(&mut self, mut push: impl FnMut(Hit)) -> Result<()> {
-        while self.searching {
-            match self.search.hits.try_recv() {
-                Ok(hit) => {
-                    let hit = hit?;
-                    self.found.insert(hit.path.clone(), hit.clone());
-                    push(hit);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => self.searching = false,
-            }
-        }
-        Ok(())
     }
 
     /// The area for one image full screen.
@@ -342,17 +322,6 @@ impl Core {
             Some(i) => _ = self.marks.remove(i),
             None => self.marks.push(path),
         }
-    }
-
-    fn hits(&self, paths: Vec<PathBuf>) -> Vec<Hit> {
-        (paths.into_iter())
-            .map(|path| {
-                self.found
-                    .get(&path)
-                    .cloned()
-                    .unwrap_or_else(|| Hit::new(path))
-            })
-            .collect()
     }
 
     fn marked(&self, path: &Path) -> bool {
@@ -442,8 +411,8 @@ impl Core {
 /// What scatter and grid mode do in their own way: where the images go and which one is next.
 /// `App` handles the keys that they share.
 trait Board {
-    /// Takes a hit, after the ones before it.
-    fn push(&mut self, hit: Hit);
+    /// Takes a hit at index `at` of the order on the board.
+    fn push(&mut self, hit: Hit, at: usize);
 
     /// Drops all hits, before the hits come again in a new order. `order` tells how they come.
     fn clear(&mut self, order: &Order<()>);
@@ -559,18 +528,20 @@ impl<B: Board> App<B> {
             && self.running.is_empty()
     }
 
-    /// Gives each new hit to the ranking and the board.
+    /// Gives each new hit to the ranking, which tells its place on the board.
     fn drain(&mut self) -> Result<()> {
-        let Self {
-            core,
-            board,
-            ranking,
-            ..
-        } = self;
-        core.drain(|hit| {
-            ranking.add(&hit);
-            board.push(hit);
-        })
+        while self.core.searching {
+            match self.core.search.hits.try_recv() {
+                Ok(hit) => {
+                    let hit = hit?;
+                    let at = self.ranking.add(hit.clone(), &self.core.search.order);
+                    self.board.push(hit, at);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => self.core.searching = false,
+            }
+        }
+        Ok(())
     }
 
     /// Shows the hits in the order of a new ranking.
@@ -583,7 +554,7 @@ impl<B: Board> App<B> {
                     &self.core.search.order
                 };
                 self.board.clear(order);
-                hits.into_iter().for_each(|hit| self.board.push(hit));
+                (hits.into_iter().enumerate()).for_each(|(at, hit)| self.board.push(hit, at));
             }
             Ok(None) => {}
             Err(e) => self.fail(&e),
@@ -636,7 +607,7 @@ impl<B: Board> App<B> {
         match key.code {
             KeyCode::Esc => return Break(Exit::Aborted),
             KeyCode::Enter => match self.picked() {
-                Some(paths) => return Break(Exit::Picked(self.core.hits(paths))),
+                Some(paths) => return Break(Exit::Picked(self.ranking.hits(&paths))),
                 None => self.board.key(&mut self.core, KeyCode::Enter),
             },
             KeyCode::Tab => {
@@ -706,7 +677,7 @@ impl<B: Board> App<B> {
                     self.core.marks.push(zoom.path);
                 }
                 let marks = mem::take(&mut self.core.marks);
-                return Break(Exit::Picked(self.core.hits(marks)));
+                return Break(Exit::Picked(self.ranking.hits(&marks)));
             }
             KeyCode::Tab => {
                 self.core.toggle_mark(zoom.path.clone());
